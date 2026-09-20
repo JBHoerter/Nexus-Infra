@@ -17,6 +17,7 @@
         ];
       };
       vm-base = import ./vm-modules/base.nix;
+      vm-persistent = import ./vm-modules/persistent.nix;
     };
   };
 }

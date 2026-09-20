@@ -1,11 +1,14 @@
 # Nexus Infra
 
-Reusable NixOS modules. This public repository never depends on a private deployment.
+Reusable NixOS host and MicroVM modules. Dependencies point from a deployment to this public repository, never back to a private deployment.
 
-- `host-modules/base.nix`: existing physical-host baseline.
-- `host-modules/microvm-host.nix`: MicroVM host capability; the flake export also imports the pinned upstream host module.
-- `vm-modules/base.nix`: small QEMU/KVM guest defaults and a read-only host Nix store share. Import through a host's `microvm.vms.<name>.config`.
+- `nixosModules.host-base`: physical-host baseline.
+- `nixosModules.microvm-host`: pinned upstream MicroVM host integration. For fully declarative guests, backing filesystems are required before share directories, virtiofs daemons and guests start.
+- `nixosModules.vm-base`: small QEMU/KVM guest defaults and a read-only host Nix-store share.
+- `nixosModules.vm-persistent`: named persistent directory requests using virtiofs.
 
-The deployment owns physical machines, VM instances, addresses and named storage mappings. Use `nixosModules.host-base`, `nixosModules.microvm-host` and `nixosModules.vm-base` from this flake. Follow this flake's `nixpkgs` input from the deployment to use one package set.
+A guest requests `nexus.persistence.<name>.mountPoint`. Its deployment supplies `nexus.persistence.<name>.source`. The module produces the virtiofs share; the host module orders startup against the actual backing filesystem. Disk identities, concrete paths, VM names, addresses and placements remain in the deployment.
+
+Import guest modules through `microvm.vms.<name>.config`. Set this flake's `nixpkgs` input to follow the deployment's package set. The lock file pins upstream dependencies.
 
 Upstream: https://microvm-nix.github.io/microvm.nix/declarative.html
