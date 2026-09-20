@@ -1,9 +1,22 @@
 {
   description = "Nexus Infra - reusable NixOS infrastructure modules";
 
-  outputs = { self }: {
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    microvm.url = "github:microvm-nix/microvm.nix";
+    microvm.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { microvm, ... }: {
     nixosModules = {
       host-base = import ./host-modules/base.nix;
+      microvm-host = {
+        imports = [
+          microvm.nixosModules.host
+          ./host-modules/microvm-host.nix
+        ];
+      };
+      vm-base = import ./vm-modules/base.nix;
     };
   };
 }
