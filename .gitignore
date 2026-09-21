@@ -1,0 +1,28 @@
+# Nix build outputs; lock files remain tracked.
+/result
+/result-*
+/.direnv/
+# Python/editor artifacts.
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+# Local credentials and runtime state never belong in Git.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+auth.json
+initial-password
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/runtime/
+/state/
+*.qcow2
+*.img
