@@ -1,0 +1,173 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "owner": "mailcow",
+    "repo": "mailcow-dockerized",
+    "rev": "2ac4b1deaee50e1284d644cecc16dcb0b37e67e2",
+    "hash": "sha256-QdldVeWHgQ5TnHfZpAQj125rmFhGkj6Q25Gi7kPntN0="
+  },
+  "images": {
+    "acme-mailcow": {
+      "imageName": "ghcr.io/mailcow/acme",
+      "imageDigest": "sha256:7fd23429495e61152b666acc132c71ab5847a1f30ec7c2be9ffca526c8785bde",
+      "hash": "sha256-pV2QEMWk9pCNHQQFJpifRzQW6wrUYkzELVrXN2/7xd8=",
+      "finalImageName": "nexus-lab-acme-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "clamd-mailcow": {
+      "imageName": "ghcr.io/mailcow/clamd",
+      "imageDigest": "sha256:afcb57f44f668ee792427ff9951d26226e58c03b4ac7789cf32a611468e58f59",
+      "hash": "sha256-ZpiVFmKOqCAmInMA0QKYZV3G4rwQNo17qcyG4SGVnKM=",
+      "finalImageName": "nexus-lab-clamd-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "dockerapi-mailcow": {
+      "imageName": "ghcr.io/mailcow/dockerapi",
+      "imageDigest": "sha256:90d6f26eb3fb8a47696d8719b71e9159849d5b49e4ce3e48967f2dfb5a8df55a",
+      "hash": "sha256-i82u+zke/Iu0r4TeYJWMjhKURHUcp4VRRUDYES3WGyQ=",
+      "finalImageName": "nexus-lab-dockerapi-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "dovecot-mailcow": {
+      "imageName": "ghcr.io/mailcow/dovecot",
+      "imageDigest": "sha256:4b351795c1e08f52c6ea5de23054fb7ff94d144ff3263821178cc4f883b6f0e1",
+      "hash": "sha256-jgboTDRKx5m0NCstiVJYPyyBRFikYMpvmXpYr0/nB2o=",
+      "finalImageName": "nexus-lab-dovecot-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "memcached-mailcow": {
+      "imageName": "docker.io/library/memcached",
+      "imageDigest": "sha256:7381333da6d6ae06e02d8dfc87ee6f2c7cd0a19f7ba048d5efc538d2100e2208",
+      "hash": "sha256-iLOQLwopADiRyWnTCvH7nyX+Rmlz6+EBA9xBBuQYxsM=",
+      "finalImageName": "nexus-lab-memcached-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "mysql-mailcow": {
+      "imageName": "docker.io/library/mariadb",
+      "imageDigest": "sha256:be981e4113326ada8d6004174dd09eeaefc03094037f811182a52d4f2e737350",
+      "hash": "sha256-GkVhA+7wCRcYGP7Kubg8zksUoKyRnPvdX8v3GvTgPIA=",
+      "finalImageName": "nexus-lab-mysql-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "netfilter-mailcow": {
+      "imageName": "ghcr.io/mailcow/netfilter",
+      "imageDigest": "sha256:a6c7f44c10c5edf01afa1bb155d1d42e2b04f81284a738a2d5643c834c33a143",
+      "hash": "sha256-Szars6Kfva2Atf5CXyONWLbOSj205pLKLlvKX8lJ50c=",
+      "finalImageName": "nexus-mailcow-netfilter",
+      "finalImageTag": "1.64",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "nginx-mailcow": {
+      "imageName": "ghcr.io/mailcow/nginx",
+      "imageDigest": "sha256:338d06425db6948b6ae649351c8a8dad920416c52c85dc4be272222f38988a74",
+      "hash": "sha256-P//eHMeZ/awKds2qsFcoQyj1a6PFtXZ2tYjh69oVs6s=",
+      "finalImageName": "nexus-lab-nginx-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "ofelia-mailcow": {
+      "imageName": "docker.io/mcuadros/ofelia",
+      "imageDigest": "sha256:efcbe2c5cf658a25de6443c1462d653f9cc03791d642e01fc6c638a00f97e492",
+      "hash": "sha256-ScQE4oBLIaUpWios95Zgg82WzuFtWBwilODsU89Xqoo=",
+      "finalImageName": "nexus-lab-ofelia-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "olefy-mailcow": {
+      "imageName": "ghcr.io/mailcow/olefy",
+      "imageDigest": "sha256:cec980cddf162594f5f1a7b575ae95c0f17f0c42febcfac94a478eca2d2bfd9e",
+      "hash": "sha256-YS0lRcLlgORB5C2RciwT4XIrrtcun+5m+2+vwN5l3jo=",
+      "finalImageName": "nexus-lab-olefy-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "php-fpm-mailcow": {
+      "imageName": "ghcr.io/mailcow/phpfpm",
+      "imageDigest": "sha256:389a6d57b754744ca38196a6bb7b89b4a53463179da03c03529f73d45ba2f202",
+      "hash": "sha256-kRhg4vC/1kDDQl29qKRnrj53LmKCHcsEVJfoWqC4t78=",
+      "finalImageName": "nexus-lab-php-fpm-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "postfix-mailcow": {
+      "imageName": "ghcr.io/mailcow/postfix",
+      "imageDigest": "sha256:32d3ec02518c05c88f4fc7ef21209c44a6c7ad69541dc0b6a245e42d049ad469",
+      "hash": "sha256-c3TmRTLzELrxE3cHtMaqt/CasEBTvgRqkS+zZ5o2SCc=",
+      "finalImageName": "nexus-lab-postfix-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "postfix-tlspol-mailcow": {
+      "imageName": "ghcr.io/mailcow/postfix-tlspol",
+      "imageDigest": "sha256:44d2b3fb5a1fa8be7741e27cd468bcfaeff3c8820f89db1f5d4a6e9f6f872280",
+      "hash": "sha256-0bHcIALWQsrczdmVQJC7Bb7SfSWuALwsq5Y2L1VpnJI=",
+      "finalImageName": "nexus-lab-postfix-tlspol-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "redis-mailcow": {
+      "imageName": "docker.io/library/redis",
+      "imageDigest": "sha256:3b73847e72874be07e6657b129a94761662b79bc0f679273757d4218573b2a98",
+      "hash": "sha256-RHj4dFP1Z/7zc6DC+0ybUNBHgAeMVV8+9ZPJoW3BvDU=",
+      "finalImageName": "nexus-mailcow-redis",
+      "finalImageTag": "7.4.6-alpine",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "rspamd-mailcow": {
+      "imageName": "ghcr.io/mailcow/rspamd",
+      "imageDigest": "sha256:2c696caf86924253c64c6a2a898604aac1994cdaf61aa12bcc20b6dbb43a8b0c",
+      "hash": "sha256-c9xJD8GSTFZ13QhP07k8QaaPSANZySytQwzJ7D5jdgc=",
+      "finalImageName": "nexus-lab-rspamd-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "sogo-mailcow": {
+      "imageName": "ghcr.io/mailcow/sogo",
+      "imageDigest": "sha256:1d664605551f0b39d12dab019a0ba1255814487af88ef7f5a6f47fadb307a85b",
+      "hash": "sha256-bIW6osy6t5sRKkQHS1xWCI0vJN5nel5ECFZKLfhs6pA=",
+      "finalImageName": "nexus-lab-sogo-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "unbound-mailcow": {
+      "imageName": "ghcr.io/mailcow/unbound",
+      "imageDigest": "sha256:098816f26207927e798bd55acf54a2cffed1f420b839a429089a65929c4464b0",
+      "hash": "sha256-CyB6aKHdm9pL1kF2XOME5Xdx5yfr4FCwN2V+hJIc+0Q=",
+      "finalImageName": "nexus-lab-unbound-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    },
+    "watchdog-mailcow": {
+      "imageName": "ghcr.io/mailcow/watchdog",
+      "imageDigest": "sha256:5436050d566d972cb157225f8a2b5c828c6bb188118f3bcab94dd8db065892c7",
+      "hash": "sha256-hWSm3MNY9anuNS/B4SijSfLliPwwsbLwSML01Dojl0w=",
+      "finalImageName": "nexus-lab-watchdog-mailcow",
+      "finalImageTag": "fixture",
+      "os": "linux",
+      "arch": "amd64"
+    }
+  }
+}

@@ -127,3 +127,28 @@ nix build --no-link --print-build-logs --max-jobs 1 --cores 2 \
 These checks run disposable NixOS test machines, not services on the builder. They exercise private user/network namespaces, restricted mounts, synthetic state transfer, and Docker Compose inside an outer container using the pinned `crun` runtime. The native check uses two 1536 MiB test machines; the Docker check uses one 3072 MiB machine. New files must be tracked for Git-backed flake evaluation, or evaluated using a `path:` source during development. Passing these synthetic checks does not establish Mailcow compatibility, production isolation, or automated workload recovery.
 
 The Mailcow netfilter component check is available as `checks.x86_64-linux.nspawn-mailcow-netfilter`. It fetches digest-pinned public images and tests the nftables backend with reduced network capabilities inside the outer container; it is not a full Mailcow integration test. This component probe uses an isolated Redis fixture and IP-only rules; it does not validate live DNS, SMTP/IMAP, stock privileged Compose behavior, or application-data restoration.
+
+### Explicit Mailcow integration lab
+
+`packages.x86_64-linux.mailcow-integration-lab` builds a test driver for an explicitly run, disposable integration VM. It is not part of the default flake checks because stock DNS health checks and antivirus updates require network access.
+
+Run only on a suitable x86_64-linux KVM builder. The VM uses 8 GiB RAM, two virtual CPUs and a sparse 32 GiB disk. Before starting, require at least 11 GiB available host RAM and 40 GiB available disk space. Run one lab at a time; never activate its configuration on a real host.
+
+```sh
+driver=$(nix build --no-link --print-out-paths --max-jobs 1 --cores 2 .#mailcow-integration-lab)
+run_dir=$(mktemp -d /tmp/nexus-mailcow-run.XXXXXX)
+(cd "$run_dir" && XDG_RUNTIME_DIR="$run_dir" "$driver/bin/nixos-test-driver" \
+  --keep-machine-state --output_directory "$run_dir" --junit-xml "$run_dir/results.xml")
+```
+
+Use a fresh run directory for each complete execution. The test creates a synthetic domain/mailbox and sends one internal message; replaying the entire script against a completed saved state is not an idempotent recovery operation. Retained VM disks contain synthetic credentials and must remain access-restricted. Disk-backed `XDG_RUNTIME_DIR` avoids filling a small user runtime tmpfs.
+
+The lab uses frozen source/image inputs from `tests/mailcow-lab-inputs.json`, a private UID mapping, pinned `crun`, and a declared process-limit envelope. Mailcow netfilter uses its nftables backend with only `NET_ADMIN`/`NET_RAW` rather than privileged mode. A VM-level egress guard blocks external SMTP and private-network access while allowing initialization DNS, HTTP(S) and ICMP. No host ports are forwarded. Certificates and credentials are generated inside the fixture, and certificate verification remains strict.
+
+Coverage includes stable startup of all 18 services, required Unbound/ClamAV health checks, API domain/mailbox creation, authenticated TLS submission, exact-content IMAP retrieval, and message/certificate persistence after outer-container restart. This is an IPv4 lab with a private test CA and internal delivery. It does not certify public SMTP deliverability, public ACME renewal, IPv6, backup restoration, host-loss recovery or upstream support for nested Mailcow.
+
+Pure helper regressions can run without Nix or Docker:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_mailcow_lab.py -v
+```

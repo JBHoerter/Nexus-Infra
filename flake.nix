@@ -28,5 +28,8 @@
         nspawn-docker = pkgs.testers.runNixOSTest (import ./tests/nspawn-docker.nix);
         nspawn-mailcow-netfilter = pkgs.testers.runNixOSTest (import ./tests/nspawn-mailcow-netfilter.nix);
       };
+    packages.x86_64-linux.mailcow-integration-lab =
+      let pkgs = import nixpkgs { system = "x86_64-linux"; };
+      in (pkgs.testers.runNixOSTest (import ./tests/mailcow-integration.nix)).driver;
   };
 }
