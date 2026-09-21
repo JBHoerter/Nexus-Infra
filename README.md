@@ -92,6 +92,20 @@ console/                  Agent, management API, frontend and security tests
 docs/                     Deployment, storage and networking guidance
 ```
 
+## Development model
+
+Nexus is built incrementally in agent-driven passes. A planning conversation produces a bounded prompt — scope, safety rules, inspection-before-change — and an agent executes it over SSH against the target host; each pass lands as commits validated on the running system before the next begins. Work so far was executed by Codex from prompts drafted in a separate ChatGPT planning conversation.
+
+Per-commit provenance and session history are tracked with [Partial](https://github.com/JBHoerter/Partial): a `post-commit` hook plus `.devin/` agent hooks record sessions, and `partial checkpoints` in a checkout shows which session produced each commit. The original transcripts are imported, so `partial search` and the dashboard answer "why was this built this way" directly.
+
+Design intent beyond the current pass, in rough priority order:
+
+- **Fresh-host reproducibility** — provision a new VPS (e.g. Hetzner via `nixos-anywhere` or a pre-built NixOS ISO) and reach the same configuration from this flake plus the private deployment.
+- **Separated data layer** — persistent application data lives on dedicated storage so compute can be rebuilt from pinned configuration alone.
+- **AI-agent operators** — a dev environment where agents run *against* the infrastructure from inside it.
+- **Public ingress** — Cloudflare/DNS/TLS-terminated ingress is deliberately deferred until LAN-mode routing is proven. Headscale stays coordination-only; workload traffic should eventually flow peer-to-peer.
+- **Mail service** — a Mailcow-class appliance is under evaluation; it is the least Nix-native piece and not committed yet.
+
 ## Limits and contributing
 
 There is no scheduler, migration, automatic failover, distributed storage, historical metrics database or automatic desired-state reconciliation. Persistent volumes share filesystem capacity without per-volume quotas. Console authentication currently has one administrator; certificate rotation is manual. The current deployment uses LAN HTTP ingress, not public TLS/DNS or a production access policy.
