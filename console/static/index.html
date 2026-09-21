@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark"><title>Nexus · Cluster console</title>
+<link rel="stylesheet" href="/console/style.css"><script src="/console/app.js" defer></script>
+</head>
+<body>
+<div id="login-screen" class="login-screen">
+  <div class="login-art"><div class="wordmark"><span class="brand-icon">N</span> NEXUS</div><p class="eyebrow">INFRASTRUCTURE / UNDER YOUR CONTROL</p><h1>A clear view.<br>A deliberate action.</h1><p>Hosts, workloads and persistent state.<br>One place to understand your cluster.</p><div class="orbit"><span>HOSTS</span><span>WORKLOADS</span><span>NETWORK</span></div></div>
+  <section class="login-panel"><p class="eyebrow">NEXUS CONSOLE</p><h2>Welcome back</h2><p class="muted">Sign in to observe and manage your cluster.</p><form id="login-form"><label for="password">Administrator password</label><input id="password" type="password" autocomplete="current-password" required maxlength="256"><button id="login-submit" type="submit">Open console <span>→</span></button><p id="login-error" class="error" role="alert"></p></form><p class="login-note">Use the console credential provided by your cluster administrator.</p></section>
+</div>
+<div id="shell" hidden>
+  <aside><a class="wordmark" href="#overview"><span class="brand-icon">N</span> NEXUS</a><div class="sidebar-caption">CLUSTER WORKSPACE</div><nav aria-label="Primary"><a href="#overview" data-view="overview"><span>◈</span>Overview</a><a href="#workloads" data-view="workloads"><span>▦</span>Workloads</a><a href="#storage" data-view="storage"><span>▤</span>Storage</a><a href="#network" data-view="network"><span>⌘</span>Network</a><a href="#activity" data-view="activity"><span>◷</span>Activity</a></nav><div class="sidebar-bottom"><div class="mini-label">STATE MODEL</div><p>Live observations<br><span>+ activated declarations</span></p><div class="boundary">Bounded controls enabled</div></div></aside>
+  <div class="workspace"><header><div><span class="muted">Nexus</span><span class="slash">/</span><span id="breadcrumb">Overview</span></div><div class="header-actions"><span id="connection" class="status-chip">Connecting</span><button id="refresh" class="icon-button" title="Refresh cached cluster state" aria-label="Refresh">↻</button><button id="logout" class="quiet">Sign out</button></div></header><main id="content" aria-live="polite"></main><footer><span id="updated">Waiting for observations</span><span>Five-second sampling · no automatic reconciliation</span></footer></div>
+</div>
+<dialog id="action-dialog"><form method="dialog"><span class="eyebrow">WORKLOAD CONTROL</span><h2 id="action-title"></h2><p id="action-description"></p><div class="callout">This changes live state only. The Nix declaration remains in place.</div><div class="dialog-actions"><button value="cancel" class="quiet">Cancel</button><button id="confirm-action" value="confirm">Confirm</button></div></form></dialog>
+<div id="toast" role="status" hidden></div>
+</body></html>
