@@ -81,7 +81,7 @@ class Console:
                 self.hosts[host_id].update(online=False, error='Host agent unreachable; showing last observation')
 
     def loop(self):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, max(1, len(self.hosts)))) as pool:
             while True:
                 list(pool.map(self.poll, self.hosts))
                 time.sleep(5)

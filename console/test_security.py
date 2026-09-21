@@ -38,7 +38,7 @@ class BoundaryTests(unittest.TestCase):
 
     def test_http_body_limits_and_shape(self):
         handler=object.__new__(Handler)
-        for raw in (b'[]',b'{"action":"restart","command":"id"}',b'{"action":'):
+        for raw in (b'[]',b'{"action":"restart","command":"id"}',b'{"action":', b'{"action":"start","action":"stop"}'):
             handler.headers=Message();handler.headers['Content-Type']='application/json';handler.headers['Content-Length']=str(len(raw));handler.rfile=io.BytesIO(raw)
             self.reject(400,handler.body,['action'],128)
         handler.headers['Transfer-Encoding']='chunked'

@@ -30,8 +30,8 @@ in {
     systemd.services.nexus-agent = {
       description = "Nexus host agent";
       wantedBy = [ "multi-user.target" ];
-      wants = [ "network-online.target" ];
-      after = [ "network-online.target" "polkit.service" ];
+      # Binding retries until the private address exists; do not wait on unrelated links.
+      after = [ "network.target" "polkit.service" ];
       path = [ pkgs.systemd pkgs.iproute2 ];
       serviceConfig = {
         ExecStart = "${pkgs.python3}/bin/python3 ${../console}/agent.py ${settingsFile}";

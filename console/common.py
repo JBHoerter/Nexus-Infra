@@ -63,10 +63,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get('Transfer-Encoding') or self.headers.get_content_type() != 'application/json':
             raise HTTPError(415, 'A JSON body is required')
         try:
-            size = int(self.headers.get('Content-Length', '-1'))
+            if len(self.headers.get_all('Content-Length', [])) != 1:
+                raise ValueError()
+            size = int(self.headers['Content-Length'])
             if not 0 <= size <= limit:
                 raise ValueError()
-            value = json.loads(self.rfile.read(size))
+            def unique_object(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError()
+                    result[key] = value
+                return result
+            value = json.loads(self.rfile.read(size), object_pairs_hook=unique_object)
             if not isinstance(value, dict) or set(value) != set(keys):
                 raise ValueError()
             return value
