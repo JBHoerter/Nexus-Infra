@@ -113,3 +113,17 @@ There is no scheduler, migration, automatic failover, distributed storage, histo
 Keep reusable mechanisms here and concrete assignments in the deployment. Never commit passwords, private keys, tokens or mutable guest state—even to a private repository. `.gitignore` is only a convenience, not a secret scanner. Public contributions must also avoid private addresses, disk IDs and deployment-specific paths.
 
 For backend changes, run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s console -v`. For Nix changes, build a consuming deployment and verify the relevant lifecycle/network/persistence behavior. See the deployment guide for a local input override that avoids publishing unfinished changes.
+
+### Isolated system-container feasibility checks
+
+On an x86_64-linux Nix builder with KVM and the `nixos-test` system feature:
+
+```sh
+nix build --no-link --print-build-logs --max-jobs 1 --cores 2 \
+  .#checks.x86_64-linux.nspawn-native \
+  .#checks.x86_64-linux.nspawn-docker
+```
+
+These checks run disposable NixOS test machines, not services on the builder. They exercise private user/network namespaces, restricted mounts, synthetic state transfer, and Docker Compose inside an outer container using the pinned `crun` runtime. The native check uses two 1536 MiB test machines; the Docker check uses one 3072 MiB machine. New files must be tracked for Git-backed flake evaluation, or evaluated using a `path:` source during development. Passing these synthetic checks does not establish Mailcow compatibility, production isolation, or automated workload recovery.
+
+The Mailcow netfilter component check is available as `checks.x86_64-linux.nspawn-mailcow-netfilter`. It fetches digest-pinned public images and tests the nftables backend with reduced network capabilities inside the outer container; it is not a full Mailcow integration test. This component probe uses an isolated Redis fixture and IP-only rules; it does not validate live DNS, SMTP/IMAP, stock privileged Compose behavior, or application-data restoration.
