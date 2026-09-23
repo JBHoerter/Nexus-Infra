@@ -152,3 +152,5 @@ Pure helper regressions can run without Nix or Docker:
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_mailcow_lab.py -v
 ```
+
+The Home Assistant/Mosquitto nested-runtime check is `checks.x86_64-linux.nspawn-homeassistant`. It preloads digest-pinned Home Assistant and Mosquitto images, runs both non-privileged under `crun` inside the outer container, verifies that container `network_mode: host` stays inside the workload network namespace, and checks that the Mosquitto retained-message database and the Home Assistant identity and configuration bytes survive an outer-container restart. It is a runtime, isolation and persistence probe only: it does not establish onboarding/authentication correctness, real MQTT integrations, radio hardware support, LAN/multicast discovery, or recovery onto a different host.
