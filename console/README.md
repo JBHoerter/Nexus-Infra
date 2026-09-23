@@ -24,3 +24,15 @@ Agents require client certificates and verified TLS. Host certificate identities
 ## Deliberate limits
 
 One administrator, no roles or shared session storage; in-memory sessions expire on service restart. No historical metrics store. Volume attachments share backend capacity; per-directory consumption is not measured. Certificate rotation and host enrollment are manual. No automatic failover, relocation, or configuration editing. Infrastructure VMs can be marked protected to prevent self-disruption.
+
+## Internal workload catalog contract
+
+`catalog.py` defines the internal `schemaVersion: 2` workload-definition contract used for catalog and admission work. `seal_definition` computes a canonical JSON `sha256` revision digest over a caller-supplied definition that must not already carry one; `validate_definition` strictly checks every field and verifies the digest; `Catalog` stores canonical JSON bytes, rejects duplicate workload IDs, unknown dependencies and dependency cycles, and answers exact `(workloadId, revisionDigest)` lookups with detached copies; `admit` is a pure preflight returning an eligible flag plus an ordered reason list — it performs no scheduling, reservation, health check or fencing.
+
+The contract is deliberately narrow: `nspawn-v1` runtime only (archived metadata records carry a null runtime and are never executable), artifact records are `id`/`kind`/`digest` references without presence or signature verification, state mount points are internal guest paths with reserved roots and overlap rejection, `quiesce-v1` is the only consistency adapter, and the contract accepts no secret-value fields — only secret-set references; operators must not put secrets in metadata. Digest equality proves content consistency, not authority. There is no v2 HTTP endpoint; the existing v1 API is unchanged.
+
+Pure contract tests run without Nix, hosts or credentials:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s console -p test_catalog.py -v
+```
