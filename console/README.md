@@ -31,8 +31,11 @@ One administrator, no roles or shared session storage; in-memory sessions expire
 
 The contract is deliberately narrow: `nspawn-v1` runtime only (archived metadata records carry a null runtime and are never executable), artifact records are `id`/`kind`/`digest` references without presence or signature verification, state mount points are internal guest paths with reserved roots and overlap rejection, `quiesce-v1` is the only consistency adapter, and the contract accepts no secret-value fields — only secret-set references; operators must not put secrets in metadata. Digest equality proves content consistency, not authority. There is no v2 HTTP endpoint; the existing v1 API is unchanged.
 
+`artifacts.py` compiles a Nix `exportReferencesGraph` closure record into a workload bundle: `build_manifest` selects `path`/`narHash`/`narSize`/`references` into a canonical, path-sorted manifest, `validate_manifest` strictly checks shape, store-path syntax, NAR-hash encodings, reference integrity and root reachability (self-references and cycles are legal), and `seal_workload` inserts the manifest digest as the `runtimeArtifactId` entry into a draft definition before `seal_definition` validates it. The digest covers exact canonical manifest bytes. The `build` CLI writes `artifact.json`, `artifact.sha256` and `definition.json` inside a Nix derivation; it verifies nothing about signatures, distribution or recovery.
+
 Pure contract tests run without Nix, hosts or credentials:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s console -p test_catalog.py -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s console -p 'test_catalog.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s console -p 'test_artifacts.py' -v
 ```

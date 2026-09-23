@@ -9,6 +9,7 @@
 
   outputs = { nixpkgs, microvm, ... }: {
     lib.tests.antragsbank = import ./tests/nspawn-antragsbank.nix;
+    lib.buildWorkload = import ./workload-modules/build.nix { inherit nixpkgs; };
     nixosModules = {
       host-base = import ./host-modules/base.nix;
       microvm-host = {
@@ -21,6 +22,8 @@
       vm-persistent = import ./vm-modules/persistent.nix;
       nexus-agent = import ./host-modules/nexus-agent.nix;
       nexus-console = import ./vm-modules/console.nix;
+      workload-base = import ./workload-modules/base.nix;
+      workload-docker = import ./workload-modules/docker.nix;
     };
     checks.x86_64-linux =
       let pkgs = import nixpkgs { system = "x86_64-linux"; };
@@ -30,6 +33,7 @@
         nspawn-mailcow-netfilter = pkgs.testers.runNixOSTest (import ./tests/nspawn-mailcow-netfilter.nix);
         nspawn-homeassistant = pkgs.testers.runNixOSTest (import ./tests/nspawn-homeassistant.nix);
         nspawn-govee = pkgs.testers.runNixOSTest (import ./tests/nspawn-govee.nix);
+        workload-artifact = pkgs.testers.runNixOSTest (import ./tests/workload-artifact.nix { inherit nixpkgs; });
       };
     packages.x86_64-linux.mailcow-integration-lab =
       let pkgs = import nixpkgs { system = "x86_64-linux"; };
