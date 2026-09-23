@@ -8,6 +8,7 @@
   };
 
   outputs = { nixpkgs, microvm, ... }: {
+    lib.tests.antragsbank = import ./tests/nspawn-antragsbank.nix;
     nixosModules = {
       host-base = import ./host-modules/base.nix;
       microvm-host = {
