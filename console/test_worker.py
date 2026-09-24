@@ -213,6 +213,7 @@ class FakeFilesystem(worker.HostFilesystem):
         self.bundle_dir = bundle_dir
         self.chowns = []
         self.owners = {}
+        self.synced_dirs = []
 
     def _map(self, path):
         if self.bundle_dir is not None and path.startswith(FAKE_BUNDLE):
@@ -229,7 +230,10 @@ class FakeFilesystem(worker.HostFilesystem):
         os.chmod(self._map(path), mode)
 
     def sync_dir(self, path):
-        super().sync_dir(self._map(path))
+        self.synced_dirs.append(path)
+        mapped = self._map(path)
+        if mapped != path or not path.startswith('/nix/'):
+            super().sync_dir(mapped)
 
     def listdir(self, path):
         return os.listdir(self._map(path))
@@ -250,6 +254,10 @@ class FakeFilesystem(worker.HostFilesystem):
 
     def read_bytes(self, path):
         return Path(self._map(path)).read_bytes()
+
+    def read_bounded(self, path, limit):
+        with open(self._map(path), 'rb') as handle:
+            return handle.read(limit + 1)
 
     def read_text(self, path):
         if path == '/proc/meminfo':

@@ -248,6 +248,10 @@ class HostFilesystem:
     def read_bytes(self, path):
         return Path(path).read_bytes()
 
+    def read_bounded(self, path, limit):
+        with open(path, 'rb') as handle:
+            return handle.read(limit + 1)
+
 
 class Clock:
     def time(self):
@@ -368,37 +372,61 @@ _INTERNAL_ERRORS = (artifacts.ArtifactError, catalog.CatalogError, OSError,
                     sqlite3.Error, subprocess.TimeoutExpired, ValueError)
 
 
-class Worker:
-    def __init__(self, config, *, runner=None, fs=None, clock=None, boot_id=None,
-                 unit_dir='/run/systemd/system'):
-        self.config = validate_config(config)
-        self.runner = runner or Runner()
-        self.fs = fs or HostFilesystem()
-        self.clock = clock or Clock()
-        self.boot_id = boot_id if boot_id is not None else _host_boot_id()
-        self.unit_dir = unit_dir
-        state_dir = self.config['stateDir']
-        self._ensure_dir(state_dir, 0o700)
-        self._ensure_dir(os.path.join(state_dir, 'instances'), 0o700)
-        self._db_path = os.path.join(state_dir, 'worker.db')
-        self._lock_path = os.path.join(state_dir, 'worker.lock')
-        self._ensure_metadata_file(self._db_path)
-        self._ensure_metadata_file(self._lock_path)
-        self.db = sqlite3.connect(self._db_path, check_same_thread=False)
-        self.db.execute('PRAGMA journal_mode=WAL')
-        self.db.executescript(_SCHEMA)
-        columns = {row[1] for row in self.db.execute(
-            'PRAGMA table_info(instances)')}
-        if 'binding_json' not in columns:
-            self.db.execute(
-                'ALTER TABLE instances ADD COLUMN binding_json TEXT')
-        self.db.commit()
-        self._bundles = None
+def verify_closure(manifest, runner):
+    result = runner.run(
+        ['nix', '--extra-experimental-features', 'nix-command',
+         '--store', 'daemon', 'path-info', '--recursive', '--json',
+         '--json-format', '1', manifest['root']])
+    if result.returncode != 0:
+        raise WorkerError('store-verify-failed')
+    try:
+        records = json.loads(result.stdout)
+    except ValueError:
+        raise WorkerError('store-schema-unexpected') from None
+    if type(records) is dict:
+        records = [dict(record, path=path) if type(record) is dict else record
+                   for path, record in records.items()]
+    if type(records) is not list:
+        raise WorkerError('store-schema-unexpected')
+    expected = {}
+    for entry in manifest['closure']:
+        if entry['path'] in expected:
+            raise WorkerError('store-closure-mismatch')
+        expected[entry['path']] = (nar_hash_bytes(entry['narHash']),
+                                   entry['narSize'],
+                                   sorted(entry['references']))
+    seen = set()
+    for record in records:
+        if type(record) is not dict or type(record.get('path')) is not str \
+                or type(record.get('narHash')) is not str \
+                or type(record.get('narSize')) is not int \
+                or type(record.get('references')) is not list \
+                or any(type(ref) is not str for ref in record['references']):
+            raise WorkerError('store-schema-unexpected')
+        if record['path'] in seen or record['path'] not in expected:
+            raise WorkerError('store-closure-mismatch')
+        seen.add(record['path'])
+        want = expected[record['path']]
+        try:
+            actual_hash = nar_hash_bytes(record['narHash'])
+        except WorkerError:
+            raise WorkerError('store-schema-unexpected') from None
+        if actual_hash != want[0] \
+                or record['narSize'] != want[1] \
+                or sorted(record['references']) != want[2]:
+            raise WorkerError('store-closure-mismatch')
+    if seen != set(expected):
+        raise WorkerError('store-closure-mismatch')
+    paths = sorted(expected)
+    for offset in range(0, len(paths), _VERIFY_BATCH):
+        check = runner.run(
+            ['nix-store', '--store', 'daemon', '--verify-path']
+            + paths[offset:offset + _VERIFY_BATCH])
+        if check.returncode != 0:
+            raise WorkerError('store-verify-failed')
 
-    def close(self):
-        self.db.close()
 
-
+class SecurePaths:
     def _lstat(self, path):
         try:
             return self.fs.lstat(path)
@@ -471,6 +499,37 @@ class Worker:
                     not stat.S_ISREG(sibling.st_mode) or sibling.st_uid != 0
                     or stat.S_IMODE(sibling.st_mode) != 0o600):
                 raise WorkerError('path-unsafe')
+
+
+class Worker(SecurePaths):
+    def __init__(self, config, *, runner=None, fs=None, clock=None, boot_id=None,
+                 unit_dir='/run/systemd/system'):
+        self.config = validate_config(config)
+        self.runner = runner or Runner()
+        self.fs = fs or HostFilesystem()
+        self.clock = clock or Clock()
+        self.boot_id = boot_id if boot_id is not None else _host_boot_id()
+        self.unit_dir = unit_dir
+        state_dir = self.config['stateDir']
+        self._ensure_dir(state_dir, 0o700)
+        self._ensure_dir(os.path.join(state_dir, 'instances'), 0o700)
+        self._db_path = os.path.join(state_dir, 'worker.db')
+        self._lock_path = os.path.join(state_dir, 'worker.lock')
+        self._ensure_metadata_file(self._db_path)
+        self._ensure_metadata_file(self._lock_path)
+        self.db = sqlite3.connect(self._db_path, check_same_thread=False)
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.executescript(_SCHEMA)
+        columns = {row[1] for row in self.db.execute(
+            'PRAGMA table_info(instances)')}
+        if 'binding_json' not in columns:
+            self.db.execute(
+                'ALTER TABLE instances ADD COLUMN binding_json TEXT')
+        self.db.commit()
+        self._bundles = None
+
+    def close(self):
+        self.db.close()
 
 
     def _lock(self):
@@ -552,57 +611,7 @@ class Worker:
         return probe
 
     def _verify_closure(self, manifest):
-        result = self.runner.run(
-            ['nix', '--extra-experimental-features', 'nix-command',
-             '--store', 'daemon', 'path-info', '--recursive', '--json',
-             '--json-format', '1', manifest['root']])
-        if result.returncode != 0:
-            raise WorkerError('store-verify-failed')
-        try:
-            records = json.loads(result.stdout)
-        except ValueError:
-            raise WorkerError('store-schema-unexpected') from None
-        if type(records) is dict:
-            records = [dict(record, path=path) if type(record) is dict else record
-                       for path, record in records.items()]
-        if type(records) is not list:
-            raise WorkerError('store-schema-unexpected')
-        expected = {}
-        for entry in manifest['closure']:
-            if entry['path'] in expected:
-                raise WorkerError('store-closure-mismatch')
-            expected[entry['path']] = (nar_hash_bytes(entry['narHash']),
-                                       entry['narSize'],
-                                       sorted(entry['references']))
-        seen = set()
-        for record in records:
-            if type(record) is not dict or type(record.get('path')) is not str \
-                    or type(record.get('narHash')) is not str \
-                    or type(record.get('narSize')) is not int \
-                    or type(record.get('references')) is not list \
-                    or any(type(ref) is not str for ref in record['references']):
-                raise WorkerError('store-schema-unexpected')
-            if record['path'] in seen or record['path'] not in expected:
-                raise WorkerError('store-closure-mismatch')
-            seen.add(record['path'])
-            want = expected[record['path']]
-            try:
-                actual_hash = nar_hash_bytes(record['narHash'])
-            except WorkerError:
-                raise WorkerError('store-schema-unexpected') from None
-            if actual_hash != want[0] \
-                    or record['narSize'] != want[1] \
-                    or sorted(record['references']) != want[2]:
-                raise WorkerError('store-closure-mismatch')
-        if seen != set(expected):
-            raise WorkerError('store-closure-mismatch')
-        paths = sorted(expected)
-        for offset in range(0, len(paths), _VERIFY_BATCH):
-            check = self.runner.run(
-                ['nix-store', '--store', 'daemon', '--verify-path']
-                + paths[offset:offset + _VERIFY_BATCH])
-            if check.returncode != 0:
-                raise WorkerError('store-verify-failed')
+        return verify_closure(manifest, self.runner)
 
 
     def _requirements_of(self, definition):

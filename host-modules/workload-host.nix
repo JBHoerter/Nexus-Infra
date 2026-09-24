@@ -9,7 +9,7 @@ let
     storage = cfg.storage;
     capacity = cfg.capacity;
     capabilities = cfg.capabilities;
-    approvedBundles = cfg.approvedBundles;
+    approvedBundles = cfg.approvedBundles ++ cfg.approvedBundlePaths;
     slots = cfg.slots;
   });
   workerLib = pkgs.runCommand "nexus-worker-lib" { } ''
@@ -42,6 +42,11 @@ in {
       type = lib.types.listOf lib.types.package;
       default = [ ];
       description = "Allowlisted workload bundle store paths the worker may instantiate.";
+    };
+    approvedBundlePaths = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Preapproved exact store paths delivered separately; does not import their closure.";
     };
     stateDir = lib.mkOption {
       type = lib.types.str;
