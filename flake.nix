@@ -22,6 +22,7 @@
       vm-persistent = import ./vm-modules/persistent.nix;
       nexus-agent = import ./host-modules/nexus-agent.nix;
       nexus-console = import ./vm-modules/console.nix;
+      workload-host = import ./host-modules/workload-host.nix;
       workload-base = import ./workload-modules/base.nix;
       workload-docker = import ./workload-modules/docker.nix;
     };
@@ -34,6 +35,7 @@
         nspawn-homeassistant = pkgs.testers.runNixOSTest (import ./tests/nspawn-homeassistant.nix);
         nspawn-govee = pkgs.testers.runNixOSTest (import ./tests/nspawn-govee.nix);
         workload-artifact = pkgs.testers.runNixOSTest (import ./tests/workload-artifact.nix { inherit nixpkgs; });
+        workload-worker = pkgs.testers.runNixOSTest (import ./tests/workload-worker.nix { inherit nixpkgs; });
       };
     packages.x86_64-linux.mailcow-integration-lab =
       let pkgs = import nixpkgs { system = "x86_64-linux"; };

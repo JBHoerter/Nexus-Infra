@@ -33,9 +33,12 @@ The contract is deliberately narrow: `nspawn-v1` runtime only (archived metadata
 
 `artifacts.py` compiles a Nix `exportReferencesGraph` closure record into a workload bundle: `build_manifest` selects `path`/`narHash`/`narSize`/`references` into a canonical, path-sorted manifest, `validate_manifest` strictly checks shape, store-path syntax, NAR-hash encodings, reference integrity and root reachability (self-references and cycles are legal), and `seal_workload` inserts the manifest digest as the `runtimeArtifactId` entry into a draft definition before `seal_definition` validates it. The digest covers exact canonical manifest bytes. The `build` CLI writes `artifact.json`, `artifact.sha256` and `definition.json` inside a Nix derivation; it verifies nothing about signatures, distribution or recovery.
 
+`worker.py` is an experimental root-only local worker (not part of the console or agent): `nexus-worker execute` consumes a strict bounded JSON request from stdin and `nexus-worker guard` serves as the `nexus-workload@` unit `ExecCondition`. The immutable Nix-generated config pins approved store bundles, capacity ceilings and slot UID/address bindings; `prepare`/`start`/`stop` journal durable pending-then-terminal receipts in a root-owned SQLite database, re-verify the store closure against the artifact manifest through the local Nix daemon store, enforce the dedicated-storage mount UUID, gate starts through single-use boot-scoped permits, and admit only within measured capacity minus reservations (conservative — live usage may be double-counted; no quotas are enforced). `observe` exposes recorded identity and unit state only — never readiness, recoverability or fencing claims. There is no RPC server, HTTP endpoint, controller integration, secret handling, or restore/move/backup verb.
+
 Pure contract tests run without Nix, hosts or credentials:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s console -p 'test_catalog.py' -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s console -p 'test_artifacts.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s console -p 'test_worker.py' -v
 ```
