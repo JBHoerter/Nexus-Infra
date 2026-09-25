@@ -333,7 +333,7 @@ def validate_request(request):
             raise WorkerError('invalid-action')
         _hex32(request['instanceId'], 'instanceId')
         return request['action'], request
-    if request['action'] not in ('prepare', 'start', 'stop'):
+    if request['action'] not in ('prepare', 'start', 'stop', 'retire'):
         raise WorkerError('invalid-action')
     _hex32(request['operationId'], 'operationId')
     _identifier(request['workloadId'], 'workloadId')
@@ -358,7 +358,8 @@ CREATE TABLE IF NOT EXISTS instances(
     binding_json TEXT,
     boot_id TEXT,
     permit_deadline REAL,
-    permit INTEGER NOT NULL DEFAULT 0);
+    permit INTEGER NOT NULL DEFAULT 0,
+    retired INTEGER NOT NULL DEFAULT 0);
 CREATE UNIQUE INDEX IF NOT EXISTS current_workload
     ON instances(workload_id) WHERE phase IN
     ('preparing','prepared','starting','running','stopping','unknown');
@@ -525,6 +526,10 @@ class Worker(SecurePaths):
         if 'binding_json' not in columns:
             self.db.execute(
                 'ALTER TABLE instances ADD COLUMN binding_json TEXT')
+        if 'retired' not in columns:
+            self.db.execute(
+                'ALTER TABLE instances ADD COLUMN retired'
+                ' INTEGER NOT NULL DEFAULT 0')
         self.db.commit()
         self._bundles = None
 
@@ -1002,6 +1007,8 @@ class Worker(SecurePaths):
                 return self._prepare(request)
             if request['action'] == 'start':
                 return self._start(request)
+            if request['action'] == 'retire':
+                return self._retire(request)
             return self._stop(request)
         except UncertainError as error:
             return self._uncertain(request, error.code)
@@ -1019,6 +1026,8 @@ class Worker(SecurePaths):
                 return self._prepare(request)
             if request['action'] == 'start':
                 return self._resume_start(request)
+            if request['action'] == 'retire':
+                return self._resume_retire(request)
             return self._resume_stop(request)
         except UncertainError as error:
             return self._uncertain(request, error.code)
@@ -1069,13 +1078,13 @@ class Worker(SecurePaths):
         row = self.db.execute(
             'SELECT instance_id, workload_id, revision_digest, generation, slot_id,'
             ' machine_name, phase, requirements, binding_json, boot_id,'
-            ' permit_deadline, permit'
+            ' permit_deadline, permit, retired'
             ' FROM instances WHERE instance_id=?', (instance_id,)).fetchone()
         if row is None:
             return None
         keys = ('instance_id', 'workload_id', 'revision_digest', 'generation',
                 'slot_id', 'machine_name', 'phase', 'requirements', 'binding',
-                'boot_id', 'permit_deadline', 'permit')
+                'boot_id', 'permit_deadline', 'permit', 'retired')
         rec = dict(zip(keys, row))
         rec['binding'] = json.loads(rec['binding']) if rec['binding'] else None
         return rec
@@ -1107,6 +1116,8 @@ class Worker(SecurePaths):
         resume = rec is not None
         if resume:
             self._check_identity(rec, request)
+            if rec['retired']:
+                raise WorkerError('instance-retired')
             if rec['phase'] not in ('preparing', 'prepared'):
                 raise WorkerError('phase-conflict')
             self._require_binding_current(rec)
@@ -1200,6 +1211,8 @@ class Worker(SecurePaths):
     def _start(self, request):
         rec = self._get_instance(request['instanceId'])
         self._check_identity(rec, request)
+        if rec['retired']:
+            raise WorkerError('instance-retired')
         self._require_binding_current(rec)
         bundle, manifest, definition = self._resolve(
             rec['workload_id'], rec['revision_digest'])
@@ -1249,6 +1262,8 @@ class Worker(SecurePaths):
     def _resume_start(self, request):
         rec = self._get_instance(request['instanceId'])
         self._check_identity(rec, request)
+        if rec['retired']:
+            raise WorkerError('instance-retired')
         unit = self._unit_of(rec)
         if rec['phase'] == 'prepared':
             return self._start(request)
@@ -1367,6 +1382,25 @@ class Worker(SecurePaths):
         show = self._issue_stop(rec)
         return self._settle_stop(request, rec, show)
 
+    def _retire(self, request):
+        rec = self._get_instance(request['instanceId'])
+        self._check_identity(rec, request)
+        definition = self._resolve(rec['workload_id'], rec['revision_digest'])[2]
+        self._check_action_allowed(definition, 'stop')
+        self.db.execute('UPDATE instances SET retired=1, permit=0, phase=?'
+                        ' WHERE instance_id=?',
+                        ('stopping', rec['instance_id']))
+        self.db.commit()
+        rec = self._get_instance(rec['instance_id'])
+        return self._settle_stop(request, rec, self._issue_stop(rec))
+
+    def _resume_retire(self, request):
+        rec = self._get_instance(request['instanceId'])
+        self._check_identity(rec, request)
+        if not rec['retired']:
+            return self._retire(request)
+        return self._resume_stop(request)
+
     def _observe(self, request):
         rec = self._get_instance(request['instanceId'])
         if rec is None:
@@ -1389,6 +1423,8 @@ class Worker(SecurePaths):
             'unitSubState': show['SubState'] if show else 'unknown',
             'observedAt': self.clock.time(),
             'phase': rec['phase'],
+            'retired': bool(rec['retired']),
+            'unitDrained': self._unit_drained(show),
             'endpointAddress': slot['localAddress'] if slot else None,
         }
 
@@ -1409,13 +1445,13 @@ class Worker(SecurePaths):
     def guard(self, machine_name):
         try:
             row = self.db.execute(
-                'SELECT instance_id, phase, boot_id, permit_deadline, permit'
-                ' FROM instances WHERE machine_name=?',
+                'SELECT instance_id, phase, boot_id, permit_deadline, permit,'
+                ' retired FROM instances WHERE machine_name=?',
                 (machine_name,)).fetchone()
             if row is None:
                 return 1
-            instance_id, phase, boot_id, deadline, permit = row
-            if phase != 'starting' or permit != 1:
+            instance_id, phase, boot_id, deadline, permit, retired = row
+            if retired or phase != 'starting' or permit != 1:
                 return 1
             if boot_id != self.boot_id or self.clock.monotonic() >= deadline:
                 return 1

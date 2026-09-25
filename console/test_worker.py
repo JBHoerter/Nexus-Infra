@@ -2255,6 +2255,154 @@ class BindingTests(unittest.TestCase):
             self.assertTrue(observed['bindingCurrent'])
 
 
+class RetireTests(unittest.TestCase):
+    def _running(self, tmp, fs=None):
+        instance, runner, fs, clock, definition, _ = make_worker(tmp, fs=fs)
+        digest = definition['revisionDigest']
+        instance.execute(request('prepare', revisionDigest=digest))
+        instance.execute(request('start', op='bb' * 16, revisionDigest=digest))
+        return instance, runner, fs, clock, digest
+
+    def test_retire_marks_and_drains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            start_receipt = instance.execute(
+                request('start', op='bb' * 16, revisionDigest=digest))
+            action, _ = worker.validate_request(
+                request('retire', op='cc' * 16, revisionDigest=digest))
+            self.assertEqual(action, 'retire')
+            result = instance.execute(
+                request('retire', op='cc' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'stopped')
+            self.assertEqual(result['action'], 'retire')
+            observed = instance.execute(observe())
+            self.assertTrue(observed['retired'])
+            self.assertTrue(observed['unitDrained'])
+            self.assertEqual(observed['phase'], 'stopped')
+            starts = [c for c in runner.calls if c[2:3] == ['start']]
+            replay = instance.execute(
+                request('start', op='bb' * 16, revisionDigest=digest))
+            self.assertEqual(replay, start_receipt)
+            self.assertEqual(
+                len([c for c in runner.calls if c[2:3] == ['start']]),
+                len(starts))
+
+    def test_retired_rejects_start_prepare_and_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(
+                request('retire', op='cc' * 16, revisionDigest=digest))
+            instance2 = new_worker(
+                instance.config, runner=runner, fs=fs, clock=clock,
+                boot_id='new-boot-id', unit_dir=instance.unit_dir)
+            runner.owner = instance2
+            starts = [c for c in runner.calls if c[2:3] == ['start']]
+            result = instance2.execute(
+                request('start', op='dd' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'instance-retired')
+            result = instance2.execute(
+                request('prepare', op='ee' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'instance-retired')
+            self.assertEqual(
+                len([c for c in runner.calls if c[2:3] == ['start']]),
+                len(starts))
+            set_pending_start(instance2, clock)
+            self.assertEqual(
+                instance2.guard(worker._machine_name('0a' * 16)), 1)
+            rec = instance2._get_instance('0a' * 16)
+            self.assertEqual(rec['retired'], 1)
+
+    def test_new_generation_needs_retired_instance_drained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fs = FakeFilesystem()
+            instance, runner, fs, clock, digest = self._running(tmp, fs=fs)
+            fs.cgroup_populated = '1'
+            retire = request('retire', op='cc' * 16, revisionDigest=digest)
+            result = instance.execute(retire)
+            self.assertEqual(result['status'], 'uncertain', result)
+            newer = request('prepare', instance='3d' * 16, op='ee' * 16,
+                            generation=2, revisionDigest=digest)
+            result = instance.execute(newer)
+            self.assertEqual(result['status'], 'uncertain')
+            self.assertEqual(result['error'], 'operation-in-progress')
+            self.assertIsNone(instance._get_instance('3d' * 16))
+            fs.cgroup_populated = '0'
+            result = instance.execute(newer)
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'prepared')
+            old = instance._get_instance('0a' * 16)
+            self.assertEqual(old['retired'], 1)
+            self.assertEqual(old['phase'], 'stopped')
+
+    def test_retire_after_binding_drift_still_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.config['storage']['uuid'] = 'drifted-uuid'
+            observed = instance.execute(observe())
+            self.assertFalse(observed['bindingCurrent'])
+            result = instance.execute(
+                request('retire', op='cc' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'stopped')
+            result = instance.execute(
+                request('start', op='dd' * 16, revisionDigest=digest))
+            self.assertEqual(result['error'], 'instance-retired')
+
+    def test_retire_crash_after_marker_replays_and_drains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            retire = request('retire', op='cc' * 16, revisionDigest=digest)
+            runner.crash_after = 'stop'
+            with self.assertRaises(KeyboardInterrupt):
+                instance.execute(retire)
+            instance2 = new_worker(
+                instance.config, runner=runner, fs=fs, clock=clock,
+                boot_id='new-boot-id', unit_dir=instance.unit_dir)
+            runner.owner = instance2
+            rec = instance2._get_instance('0a' * 16)
+            self.assertEqual(rec['retired'], 1)
+            self.assertEqual(rec['phase'], 'stopping')
+            stops = [c for c in runner.calls if c[2:3] == ['stop']]
+            result = instance2.execute(retire)
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'stopped')
+            rec = instance2._get_instance('0a' * 16)
+            self.assertEqual(rec['retired'], 1)
+            self.assertEqual(
+                len([c for c in runner.calls if c[2:3] == ['stop']]),
+                len(stops))
+
+    def test_retire_systemd_unknown_stays_uncertain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            runner.show_mode = 'rc'
+            result = instance.execute(
+                request('retire', op='cc' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'uncertain')
+            rec = instance._get_instance('0a' * 16)
+            self.assertEqual(rec['retired'], 1)
+            self.assertEqual(rec['phase'], 'unknown')
+            observed = instance.execute(observe())
+            self.assertIsNone(observed['unitDrained'])
+
+    def test_retire_replay_exact_receipt_no_effects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            retire = request('retire', op='cc' * 16, revisionDigest=digest)
+            result = instance.execute(retire)
+            self.assertEqual(result['status'], 'completed', result)
+            stops = [c for c in runner.calls if c[2:3] == ['stop']]
+            replay = instance.execute(retire)
+            self.assertEqual(replay, result)
+            self.assertEqual(
+                len([c for c in runner.calls if c[2:3] == ['stop']]),
+                len(stops))
+            self.assertEqual(instance._get_instance('0a' * 16)['retired'], 1)
+
+
 class OrphanRuntimeTests(unittest.TestCase):
     def test_untracked_active_unit_blocks_prepare(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,52 +1,7 @@
 { nixpkgs }:
 let
   canary = import ./workload-canary.nix { inherit nixpkgs; };
-  hostNode = { hostId, uuid, slots }: { pkgs, lib, config, ... }: {
-    imports = [ ../host-modules/workload-host.nix ];
-    virtualisation.memorySize = 1536;
-    virtualisation.cores = 1;
-    virtualisation.useNixStoreImage = true;
-    virtualisation.emptyDiskImages = [ 128 ];
-    systemd.services.nix-daemon.serviceConfig = {
-      PrivateMounts = true;
-      ExecStart = [
-        ""
-        (pkgs.writeShellScript "nix-daemon-store-view" ''
-          set -eu
-          view=$(${pkgs.coreutils}/bin/mktemp -d /run/nix-daemon-view.XXXXXX)
-          mkdir "$view/upper" "$view/work"
-          ${pkgs.util-linux}/bin/mount -t overlay overlay \
-            -o "lowerdir=/nix/store,upperdir=$view/upper,workdir=$view/work" \
-            /nix/store
-          exec ${config.nix.package}/bin/nix-daemon --daemon
-        '')
-      ];
-    };
-    systemd.services.register-nix-paths.script = lib.mkForce ''
-      if [[ "$(cat /proc/cmdline)" =~ regInfo=([^ ]*) ]]; then
-        ${pkgs.util-linux}/bin/unshare --mount --propagation private \
-          ${pkgs.runtimeShell} -c '
-            set -e
-            view=$(${pkgs.coreutils}/bin/mktemp -d /run/register-store.XXXXXX)
-            mkdir "$view/upper" "$view/work"
-            ${pkgs.util-linux}/bin/mount -t overlay overlay \
-              -o "lowerdir=/nix/store,upperdir=$view/upper,workdir=$view/work" \
-              /nix/store
-            exec ${lib.getExe' pkgs.nix "nix-store"} --load-db
-          ' < "''${BASH_REMATCH[1]}"
-      fi
-    '';
-    environment.systemPackages = [ pkgs.curl pkgs.e2fsprogs pkgs.jq ];
-    boot.kernelModules = [ "tun" ];
-    services.nexus-workload-worker = {
-      enable = true;
-      inherit hostId slots;
-      approvedBundles = [ canary.bundle ];
-      storage = { root = "/srv/workloads"; mountPoint = "/srv/workloads"; inherit uuid; };
-      capacity = { memoryMiB = 768; cpuMillis = 1000; stateBytes = 33554432; };
-      capabilities = [ "userns" "nspawn-v1" ];
-    };
-  };
+  hostNode = args: import ./workload-worker-host.nix ({ inherit canary; } // args);
 in { pkgs, ... }: {
   name = "nexus-workload-worker";
   globalTimeout = 15 * 60;
@@ -274,5 +229,36 @@ in { pkgs, ... }: {
             "--to nix32 sha256:" + hex_digest).strip()
         converted = converted.removeprefix("sha256:")
         assert worker_module.nar_hash_bytes("sha256:" + converted).hex() == hex_digest, converted
+
+    with subtest("retired instance can never start again, even after power loss"):
+        machine_b = worker_module._machine_name(INSTANCE_B)
+        unit_b = "nexus-workload@" + machine_b + ".service"
+        rc, result = worker(target, request("d0" * 16, "retire", INSTANCE_B, 3))
+        assert result["status"] == "completed" and result["appliedPhase"] == "stopped", result
+        rc, observed = worker(target, {
+            "schemaVersion": 1, "action": "observe", "instanceId": INSTANCE_B})
+        assert observed["retired"] is True and observed["unitDrained"] is True, observed
+        rc, result = worker(target, request("d1" * 16, "start", INSTANCE_B, 3))
+        assert result["status"] == "failed" and result["error"] == "instance-retired", result
+        target.execute("systemctl start " + unit_b)
+        assert target.succeed(
+            "systemctl show " + unit_b + " --property=ActiveState --value").strip() != "active"
+        assert target.succeed(
+            "systemctl show " + unit_b + " --property=MainPID --value").strip() == "0"
+        boot_before = target.succeed("cat /proc/sys/kernel/random/boot_id").strip()
+        target.crash()
+        target.start()
+        target.wait_for_unit("multi-user.target")
+        assert target.succeed("cat /proc/sys/kernel/random/boot_id").strip() != boot_before
+        target.succeed("systemctl start nix-daemon.socket")
+        target.wait_until_succeeds(
+            "test -b /dev/disk/by-uuid/66666666-7777-4888-8999-aaaaaaaaaaaa", timeout=30)
+        target.succeed("mkdir -p /srv/workloads")
+        target.succeed("mount /dev/disk/by-uuid/66666666-7777-4888-8999-aaaaaaaaaaaa /srv/workloads")
+        rc, result = worker(target, request("d2" * 16, "start", INSTANCE_B, 3))
+        assert result["status"] == "failed" and result["error"] == "instance-retired", result
+        rc, observed = worker(target, {
+            "schemaVersion": 1, "action": "observe", "instanceId": INSTANCE_B})
+        assert observed["retired"] is True and observed["unitDrained"] is True, observed
   '';
 }
