@@ -12,9 +12,20 @@ separate records established by future authorized transport. A
 'quiesced' capture records a claimed write barrier, not proof of
 application-level consistency. Each state root's treeDigest declares
 the SHA256 of the raw decrypted/uncompressed restic tree blob bytes
-for that state root under restic-posix-v1 (restic's native tree id);
-a future engine must derive and verify each tree id from the selected
-snapshot before a point can be published as usable.
+for that state root's children, and stateSetDigest declares the same
+for the ``state`` parent node's subtree — the tree blob that carries
+every state root's own metadata (mode, ACLs, xattrs) plus child ids —
+under restic-posix-v2 (restic's native tree ids). A future engine
+must derive and verify each tree id from the selected snapshot
+before a point can be published as usable.
+
+Schema version 2 / restic-posix-v1 manifests — points sealed before
+the stateSetDigest anchor existed — remain readable for catalog and
+manual full-snapshot-id restores, but they do not bind state-root
+metadata: two otherwise identical captures whose state roots differ
+only in their own mode/ACL/xattrs alias to the same v2 identity.
+Version 2 points therefore need a native parent-tree comparison
+before reuse and are not sufficient for automatic installation.
 """
 
 import copy
@@ -30,14 +41,24 @@ class RecoveryError(ValueError):
     pass
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+_LEGACY_SCHEMA_VERSION = 2
 _KIND = 'workload-recovery-point'
-_STATE_FORMAT = 'restic-posix-v1'
+_STATE_FORMAT = 'restic-posix-v2'
+_LEGACY_STATE_FORMAT = 'restic-posix-v1'
 _ADAPTER = 'quiesce-v1'
 _CONSISTENCY = 'quiesced'
 _HEX32_RE = re.compile(r'[0-9a-f]{32}')
+# Per-version exact field sets and state formats. Legacy manifests
+# carry no stateSetDigest and are never upgraded in place.
 _FIELDS = ('schemaVersion', 'kind', 'recoveryPointId', 'definition',
-           'source', 'capture', 'stateFormat', 'state', 'secretBundle')
+           'source', 'capture', 'stateFormat', 'state', 'secretBundle',
+           'stateSetDigest')
+_LEGACY_FIELDS = ('schemaVersion', 'kind', 'recoveryPointId',
+                  'definition', 'source', 'capture', 'stateFormat',
+                  'state', 'secretBundle')
+_FORMATS = {_SCHEMA_VERSION: _STATE_FORMAT,
+            _LEGACY_SCHEMA_VERSION: _LEGACY_STATE_FORMAT}
 _MAX_I64 = 2**63 - 1
 _MAX_TIME = 2**53
 _MAX_UID_BASE = 2**32 - 131072
@@ -195,13 +216,15 @@ def _validated_secret_bundle(bundle, definition):
 
 
 def build_manifest(definition, source, capture, *, state_tree_digests,
-                   secret_bundle=None):
+                   state_set_digest, secret_bundle=None):
     record = _validated_definition(_deepcopy(definition))
     src = _validated_source(_deepcopy(source))
     cap = _validated_capture(_deepcopy(capture))
     bundle = _validated_secret_bundle(_deepcopy(secret_bundle), record)
     digests = _validated_tree_digests(_deepcopy(state_tree_digests),
                                       record)
+    set_digest = _deepcopy(state_set_digest)
+    _digest(set_digest, 'stateSetDigest')
     body = {
         'schemaVersion': _SCHEMA_VERSION,
         'kind': _KIND,
@@ -214,6 +237,7 @@ def build_manifest(definition, source, capture, *, state_tree_digests,
                   for mid in sorted(
                       mount['id'] for mount in record['stateMounts'])],
         'secretBundle': bundle,
+        'stateSetDigest': set_digest,
     }
     body['recoveryPointId'] = _point_digest(body)
     return validate_manifest(body)
@@ -223,9 +247,12 @@ def validate_manifest(value):
     if type(value) is not dict:
         raise RecoveryError('Invalid manifest')
     candidate = _deepcopy(value)
-    _fields(candidate, _FIELDS, 'manifest')
-    _integer(candidate['schemaVersion'], _SCHEMA_VERSION, _SCHEMA_VERSION,
-             'schemaVersion')
+    version = candidate.get('schemaVersion')
+    if type(version) is not int or version not in _FORMATS:
+        raise RecoveryError('Invalid schemaVersion')
+    _fields(candidate,
+            _FIELDS if version == _SCHEMA_VERSION else _LEGACY_FIELDS,
+            'manifest')
     if type(candidate['kind']) is not str or candidate['kind'] != _KIND:
         raise RecoveryError('Invalid kind')
     _digest(candidate['recoveryPointId'], 'recoveryPointId')
@@ -234,8 +261,10 @@ def validate_manifest(value):
     candidate['source'] = _validated_source(candidate['source'])
     candidate['capture'] = _validated_capture(candidate['capture'])
     if type(candidate['stateFormat']) is not str \
-            or candidate['stateFormat'] != _STATE_FORMAT:
+            or candidate['stateFormat'] != _FORMATS[version]:
         raise RecoveryError('Invalid stateFormat')
+    if version == _SCHEMA_VERSION:
+        _digest(candidate['stateSetDigest'], 'stateSetDigest')
     candidate['state'] = _validated_state(candidate['state'],
                                           candidate['definition'])
     candidate['secretBundle'] = _validated_secret_bundle(

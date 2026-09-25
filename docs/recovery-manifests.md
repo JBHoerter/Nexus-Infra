@@ -13,7 +13,7 @@ future authorized transport and evidence.
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "kind": "workload-recovery-point",
   "recoveryPointId": "sha256:<64 lowercase hex>",
   "definition": { "...": "<complete sealed catalog definition>" },
@@ -29,11 +29,12 @@ future authorized transport and evidence.
     "startedAt": 1000,
     "completedAt": 1005
   },
-  "stateFormat": "restic-posix-v1",
+  "stateFormat": "restic-posix-v2",
   "state": [
     { "id": "data", "path": "state/data",
       "treeDigest": "sha256:<64 lowercase hex>" }
   ],
+  "stateSetDigest": "sha256:<64 lowercase hex>",
   "secretBundle": null
 }
 ```
@@ -61,13 +62,21 @@ the future authorized transport and evidence records.
   upload completion.
 - `state` is the exact sorted set of the definition's `stateMounts` IDs —
   nothing omitted, nothing extra, no arbitrary excludes. Under
-  `restic-posix-v1`, each `treeDigest` is the SHA-256 of the **raw
-  decrypted/uncompressed restic tree blob bytes** for that state root
-  (restic's native tree ID, which transitively binds file blobs, child
-  trees and metadata). This module validates only the declared digest
-  references; a future engine must derive and verify each tree ID from the
-  selected snapshot and emit the manifest with matching data before a
-  point may be published as usable.
+  `restic-posix-v2`, each `treeDigest` is the SHA-256 of the **raw
+  decrypted/uncompressed restic tree blob bytes** for that state root's
+  children (restic's native tree ID), and `stateSetDigest` is the same
+  digest of the `state` parent node's subtree blob — the tree that carries
+  every state root's own metadata (mode, ACLs, xattrs) plus child ids, so
+  captures differing only in state-root metadata can no longer alias.
+  This module validates only the declared digest references; a future
+  engine must derive and verify each tree ID from the selected snapshot
+  and emit the manifest with matching data before a point may be
+  published as usable.
+- **Schema 2 / `restic-posix-v1` records remain readable** for catalog
+  reconstruction and manual full-snapshot-id restores — old points are
+  never upgraded in place — but they carry no `stateSetDigest` and do not
+  bind state-root metadata. They need a native parent-tree comparison
+  before reuse and are not sufficient for automatic installation.
 - `secretBundle` is present exactly when the definition declares a
   `secretSetRef`, and then carries only `{secretSetRef, versionDigest,
   bundleDigest}` — encrypted-bundle/version references, never key material

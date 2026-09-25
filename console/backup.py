@@ -464,7 +464,8 @@ def _validate_job(value, capture_id):
                        for mount in definition['stateMounts']}
         probe = recovery.build_manifest(
             definition, source, probe_capture,
-            state_tree_digests=placeholder)
+            state_tree_digests=placeholder,
+            state_set_digest='sha256:' + '0' * 64)
     except (recovery.RecoveryError, KeyError, TypeError):
         raise BackupError('journal-invalid') from None
     definition = probe['definition']
@@ -869,7 +870,8 @@ class BackupWorker:
                                job['definition']['stateMounts']}
                 recovery.build_manifest(
                     job['definition'], job['source'], provisional,
-                    state_tree_digests=placeholder)
+                    state_tree_digests=placeholder,
+                    state_set_digest='sha256:' + '0' * 64)
             except (recovery.RecoveryError, KeyError, TypeError):
                 raise BackupError('invalid-capture') from None
             self._save_job(job)

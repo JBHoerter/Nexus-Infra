@@ -522,7 +522,28 @@ class ResticRepository:
             # the accepted id; this verifies mount metadata only, not
             # payload blobs (full check/restore cover those).
             self._tree(subtree)
+        if manifest['schemaVersion'] == recovery._SCHEMA_VERSION \
+                and manifest['stateSetDigest'] \
+                != 'sha256:' + nodes[_STATE_NAME]['subtree']:
+            raise RepositoryError('repository-point-invalid')
         return manifest
+
+    def _snapshot_state_digest(self, snapshot_id, required_tag):
+        """Native digest of a tagged snapshot's ``state`` subtree blob.
+
+        Read through hashed tree blobs only; the returned value binds
+        every state root's own metadata and child ids even for legacy
+        manifests that never recorded a stateSetDigest."""
+        snapshot = self._snapshot(snapshot_id, required_tag)
+        nodes = self._tree(snapshot['tree'])
+        state_node = nodes.get(_STATE_NAME)
+        if state_node is None or state_node.get('type') != 'dir' \
+                or type(state_node.get('subtree')) is not str \
+                or _HEX64_RE.fullmatch(state_node['subtree']) is None:
+            raise RepositoryError('repository-point-invalid')
+        # Prove the blob itself exists and hashes to the claimed id.
+        self._tree(state_node['subtree'])
+        return 'sha256:' + state_node['subtree']
 
     # -- public operations ---------------------------------------------
 
@@ -676,6 +697,7 @@ class ResticRepository:
             probe = recovery.build_manifest(
                 definition, source, capture,
                 state_tree_digests=placeholder,
+                state_set_digest='sha256:' + '0' * 64,
                 secret_bundle=secret_bundle)
         except (KeyError, TypeError, recovery.RecoveryError):
             raise RepositoryError('invalid-capture') from None
@@ -716,6 +738,10 @@ class ResticRepository:
             manifest = recovery.build_manifest(
                 definition, source, capture,
                 state_tree_digests=digests,
+                # The state's own subtree blob carries every state
+                # root's metadata; binding its native tree id keeps
+                # captures distinct when only root mode/ACLs change.
+                state_set_digest='sha256:' + nodes[_STATE_NAME]['subtree'],
                 secret_bundle=secret_bundle)
             expected_raw = recovery.encode_manifest(manifest)
         except recovery.RecoveryError:
@@ -797,6 +823,8 @@ class ResticRepository:
         capture_tag = capture_tags[0]
         manifest = source_repository._inspect_final(
             snapshot_id, capture_tag)
+        source_digest = source_repository._snapshot_state_digest(
+            snapshot_id, capture_tag)
         tag_filter = _FINAL_TAG + ',' + capture_tag
         result = self._run(
             ['snapshots', '--json', '--tag', tag_filter],
@@ -807,6 +835,12 @@ class ResticRepository:
                 candidate_id,
                 self._inspect_final(candidate_id, capture_tag))
             if record['manifest'] != manifest:
+                raise RepositoryError('capture-conflict')
+            # A shared manifest is not proof the stored trees match:
+            # legacy v2 points carry no stateSetDigest, and state-root
+            # metadata lives only in the parent tree blob.
+            if self._snapshot_state_digest(
+                    candidate_id, capture_tag) != source_digest:
                 raise RepositoryError('capture-conflict')
             matching.append(record)
         if matching:
@@ -826,7 +860,9 @@ class ResticRepository:
             record = self._receipt(
                 candidate_id,
                 self._inspect_final(candidate_id, capture_tag))
-            if record['manifest'] != manifest:
+            if record['manifest'] != manifest \
+                    or self._snapshot_state_digest(
+                        candidate_id, capture_tag) != source_digest:
                 raise RepositoryError('repository-point-invalid')
             records.append(record)
         if not records:

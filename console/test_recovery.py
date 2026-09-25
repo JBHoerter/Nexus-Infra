@@ -10,6 +10,7 @@ from test_catalog import base_definition, sealed
 
 
 INSTANCE = 'ab' * 16
+SET_DIGEST = 'sha256:' + '5' * 64
 
 
 def source(**overrides):
@@ -41,7 +42,21 @@ def manifest(**kwargs):
         kwargs.get('source') or source(),
         kwargs.get('capture') or capture(),
         state_tree_digests=digests,
+        state_set_digest=kwargs.get('state_set_digest') or SET_DIGEST,
         secret_bundle=kwargs.get('secret_bundle'))
+
+
+def legacy_manifest(**kwargs):
+    """Re-derive a schema-2 / restic-posix-v1 point from a v3 record.
+
+    Models the retained points sealed before the stateSetDigest
+    anchor existed; the field set and format are exactly the old
+    contract, then the point id is resealed."""
+    record = manifest(**kwargs)
+    del record['stateSetDigest']
+    record['schemaVersion'] = 2
+    record['stateFormat'] = 'restic-posix-v1'
+    return reseal(record)
 
 
 def reseal(record):
@@ -95,7 +110,8 @@ class BuildTests(unittest.TestCase):
         second = recovery.build_manifest(
             definition_rev, source_rev, capture_rev,
             state_tree_digests=dict(reversed(list(
-                tree_digests(definition_rev).items()))))
+                tree_digests(definition_rev).items()))),
+            state_set_digest=SET_DIGEST)
         self.assertEqual(
             first['recoveryPointId'], second['recoveryPointId'])
         self.assertEqual(first, second)
@@ -142,7 +158,8 @@ class BuildTests(unittest.TestCase):
         snapshot = copy.deepcopy(
             {'definition': definition, 'source': src, 'capture': cap})
         recovery.build_manifest(definition, src, cap,
-            state_tree_digests=tree_digests(definition))
+                                state_tree_digests=tree_digests(definition),
+                                state_set_digest=SET_DIGEST)
         self.assertEqual(
             {'definition': definition, 'source': src, 'capture': cap},
             snapshot)
@@ -187,7 +204,8 @@ class SealTests(unittest.TestCase):
     def test_missing_manifest_field_refused(self):
         for key in ('definition', 'source', 'capture', 'state',
                     'secretBundle', 'stateFormat', 'kind',
-                    'schemaVersion', 'recoveryPointId'):
+                    'schemaVersion', 'stateSetDigest',
+                    'recoveryPointId'):
             record = manifest()
             del record[key]
             expect_reject(record)
@@ -196,8 +214,10 @@ class SealTests(unittest.TestCase):
         for key, bad in (('kind', 'backup-snapshot'),
                          ('kind', 2),
                          ('schemaVersion', 1),
-                         ('schemaVersion', 3),
+                         ('schemaVersion', 2),
+                         ('schemaVersion', 4),
                          ('schemaVersion', True),
+                         ('stateFormat', 'restic-posix-v1'),
                          ('stateFormat', 'restic-s3-v1'),
                          ('stateFormat', None)):
             record = manifest()
@@ -214,7 +234,8 @@ class DefinitionTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError):
             recovery.build_manifest(definition, source(), capture(),
                                     state_tree_digests=
-                                    tree_digests(definition))
+                                    tree_digests(definition),
+                                    state_set_digest=SET_DIGEST)
 
     def test_archive_category_refused(self):
         definition = base_definition(
@@ -228,14 +249,16 @@ class DefinitionTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError):
             recovery.build_manifest(definition, source(), capture(),
                                     state_tree_digests=
-                                    tree_digests(definition))
+                                    tree_digests(definition),
+                                    state_set_digest=SET_DIGEST)
 
     def test_backup_disallowed_refused(self):
         definition = sealed(allowedOperations=['start', 'stop'])
         with self.assertRaises(recovery.RecoveryError):
             recovery.build_manifest(definition, source(), capture(),
                                     state_tree_digests=
-                                    tree_digests(definition))
+                                    tree_digests(definition),
+                                    state_set_digest=SET_DIGEST)
 
     def test_infrastructure_with_backup_accepted(self):
         definition = sealed(category='infrastructure',
@@ -250,7 +273,8 @@ class DefinitionTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError):
             recovery.build_manifest(definition, source(), capture(),
                                     state_tree_digests=
-                                    tree_digests(definition))
+                                    tree_digests(definition),
+                                    state_set_digest=SET_DIGEST)
 
 
 class SourceTests(unittest.TestCase):
@@ -295,7 +319,8 @@ class SourceTests(unittest.TestCase):
     def test_uid_base_upper_bound_accepted(self):
         record = recovery.build_manifest(
             sealed(), source(uidBase=2**32 - 131072), capture(),
-            state_tree_digests=tree_digests(sealed()))
+            state_tree_digests=tree_digests(sealed()),
+            state_set_digest=SET_DIGEST)
         recovery.validate_manifest(record)
 
 
@@ -425,7 +450,8 @@ class StateTests(unittest.TestCase):
                 with self.assertRaises(recovery.RecoveryError):
                     recovery.build_manifest(
                         definition, source(), capture(),
-                        state_tree_digests=bad)
+                        state_tree_digests=bad,
+                        state_set_digest=SET_DIGEST)
         # Zero-state definitions require exactly {}.
         zero = sealed(stateMounts=[])
         for bad in (None, {'data': 'sha256:' + '0' * 64}):
@@ -433,7 +459,8 @@ class StateTests(unittest.TestCase):
                 with self.assertRaises(recovery.RecoveryError):
                     recovery.build_manifest(
                         zero, source(), capture(),
-                        state_tree_digests=bad)
+                        state_tree_digests=bad,
+                        state_set_digest=SET_DIGEST)
 
     def test_tree_digest_binds_identity(self):
         definition = two_mount_definition()
@@ -442,7 +469,8 @@ class StateTests(unittest.TestCase):
         digests['data'] = 'sha256:' + 'f' * 64
         second = recovery.build_manifest(
             definition, source(), capture(),
-            state_tree_digests=digests)
+            state_tree_digests=digests,
+            state_set_digest=SET_DIGEST)
         self.assertNotEqual(first['recoveryPointId'],
                             second['recoveryPointId'])
         # Identical capture metadata, different content: both points
@@ -468,6 +496,62 @@ class StateTests(unittest.TestCase):
             record['definition']['stateMounts'][0],
             consistencyAdapter='agent-v9')
         expect_reject(record)
+
+
+class StateSetTests(unittest.TestCase):
+
+    def test_state_set_digest_binds_identity(self):
+        first = manifest()
+        second = recovery.build_manifest(
+            sealed(), source(), capture(),
+            state_tree_digests=tree_digests(sealed()),
+            state_set_digest='sha256:' + 'f' * 64)
+        # Identical metadata and identical per-mount treeDigests, but
+        # a different state-set anchor: the points must not alias.
+        for entry_a, entry_b in zip(first['state'], second['state']):
+            self.assertEqual(entry_a, entry_b)
+        self.assertNotEqual(first['recoveryPointId'],
+                            second['recoveryPointId'])
+        rebuilt = recovery.catalog_from_manifests([second, first])
+        self.assertEqual(
+            {m['recoveryPointId'] for m in rebuilt},
+            {first['recoveryPointId'], second['recoveryPointId']})
+
+    def test_anchor_field_strictness(self):
+        # A v3 record without the anchor is incomplete.
+        record = manifest()
+        del record['stateSetDigest']
+        expect_reject(record)
+        for bad in ('x', 'md5:' + '0' * 32, 'sha256:' + 'G' * 64,
+                    'sha256:' + '5' * 63, 'sha256:' + '5' * 65,
+                    7, True, None, {'x': 1}):
+            record = manifest()
+            record['stateSetDigest'] = bad
+            reseal(record)
+            with self.subTest(bad=bad):
+                expect_reject(record)
+        # A legacy record must not silently gain the new field.
+        record = legacy_manifest()
+        record['stateSetDigest'] = SET_DIGEST
+        reseal(record)
+        expect_reject(record)
+
+    def test_legacy_v2_canonical_roundtrip(self):
+        record = legacy_manifest()
+        raw = recovery.encode_manifest(record)
+        decoded = recovery.decode_manifest(raw)
+        self.assertEqual(decoded, record)
+        self.assertIsNot(decoded, record)
+        self.assertEqual(decoded['schemaVersion'], 2)
+        self.assertEqual(decoded['stateFormat'], 'restic-posix-v1')
+        self.assertNotIn('stateSetDigest', decoded)
+        # Legacy and new points coexist in one reconstructed catalog.
+        current = manifest()
+        result = recovery.catalog_from_manifests([current, record])
+        self.assertEqual(
+            {m['recoveryPointId'] for m in result},
+            {record['recoveryPointId'],
+             current['recoveryPointId']})
 
 
 class SecretBundleTests(unittest.TestCase):

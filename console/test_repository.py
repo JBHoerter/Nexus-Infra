@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import artifacts
 import recovery
 import repository
 from test_catalog import sealed
@@ -114,6 +116,7 @@ class FakeRestic:
             if stat.S_ISDIR(st.st_mode):
                 nodes.append({'name': name, 'type': 'dir',
                               'uid': self.node_uid, 'gid': self.node_gid,
+                              'mode': stat.S_IMODE(st.st_mode),
                               'subtree': self._build_tree(full),
                               'content': None})
             else:
@@ -123,6 +126,7 @@ class FakeRestic:
                 self.blobs[blob_id] = data
                 nodes.append({'name': name, 'type': 'file',
                               'uid': self.node_uid, 'gid': self.node_gid,
+                              'mode': stat.S_IMODE(st.st_mode),
                               'size': len(data), 'content': [blob_id]})
         return self._tree_blob(nodes)
 
@@ -134,6 +138,7 @@ class FakeRestic:
             if os.path.isdir(full) and not os.path.islink(full):
                 nodes.append({'name': rel, 'type': 'dir',
                               'uid': self.node_uid, 'gid': self.node_gid,
+                              'mode': stat.S_IMODE(os.lstat(full).st_mode),
                               'subtree': self._build_tree(full),
                               'content': None})
             else:
@@ -144,6 +149,7 @@ class FakeRestic:
                 file_records.append(('/' + rel, data))
                 nodes.append({'name': rel, 'type': 'file',
                               'uid': self.node_uid, 'gid': self.node_gid,
+                              'mode': stat.S_IMODE(os.lstat(full).st_mode),
                               'size': len(data), 'content': [blob_id]})
         if self.extra_root:
             nodes.append({'name': 'stray', 'type': 'file',
@@ -173,7 +179,7 @@ class FakeRestic:
         for node in nodes:
             target = os.path.join(destination, node['name'])
             if node['type'] == 'dir':
-                os.mkdir(target, 0o700)
+                os.mkdir(target, node.get('mode', 0o700))
                 self._materialize(node['subtree'], target)
             elif node['name'] == 'state' and self.symlink_state:
                 os.symlink('/nonexistent-state', target)
@@ -317,6 +323,69 @@ class FakeRestic:
             if sid == snapshot_id:
                 self.files[(copied['id'], path)] = data
         return Completed(0, b'copied 1 snapshots\n')
+
+
+def legacy_v2_manifest(record):
+    """Downgrade a sealed v3 manifest to a valid v2 record.
+
+    Models the retained points sealed before the stateSetDigest
+    anchor existed: same fields the old contract had, resealed."""
+    manifest = copy.deepcopy(record)
+    del manifest['stateSetDigest']
+    manifest['schemaVersion'] = 2
+    manifest['stateFormat'] = 'restic-posix-v1'
+    body = {key: value for key, value in manifest.items()
+            if key != 'recoveryPointId'}
+    manifest['recoveryPointId'] = 'sha256:' + hashlib.sha256(
+        artifacts.canonical_bytes(body)).hexdigest()
+    return manifest
+
+
+def serve_manifest(fake, snapshot_id, manifest):
+    """Serve a replacement manifest for an existing stored point.
+
+    The fake exposes two paths to the manifest: ``dump`` (used by
+    inspect) reads the files table, while restore materializes the
+    manifest blob referenced by the snapshot's root tree. Both must
+    carry the same bytes. The tree blob itself is not rewritten, so
+    the node's recorded size stays that of the original manifest —
+    nothing in the contract binds that field to blob content."""
+    raw = recovery.encode_manifest(manifest)
+    fake.files[(snapshot_id, '/manifest.json')] = raw
+    snapshot = next(entry for entry in fake.snapshots
+                    if entry['id'] == snapshot_id)
+    nodes = json.loads(fake.blobs[snapshot['tree']])['nodes']
+    blob_id = next(node['content'][0] for node in nodes
+                   if node['name'] == 'manifest.json')
+    fake.blobs[blob_id] = raw
+
+
+def clone_state_mode(fake, snapshot_id, mode):
+    """Duplicate a snapshot changing only a state root's mode.
+
+    The parent tree blobs are recomputed so every stored id still
+    hashes to real content; leaf subtrees are shared unchanged."""
+    snapshot = next(entry for entry in fake.snapshots
+                    if entry['id'] == snapshot_id)
+    nodes = json.loads(fake.blobs[snapshot['tree']])['nodes']
+    state_id = next(node['subtree'] for node in nodes
+                    if node['name'] == 'state')
+    children = [dict(node, mode=mode) if node['name'] == 'data'
+                else node
+                for node in json.loads(fake.blobs[state_id])['nodes']]
+    new_state = fake._tree_blob(children)
+    nodes = [dict(node, subtree=new_state) if node['name'] == 'state'
+             else node for node in nodes]
+    clone = dict(snapshot)
+    clone['tree'] = fake._tree_blob(nodes)
+    clone['id'] = hashlib.sha256(
+        ('clone:' + snapshot_id + ':' + str(mode)).encode()).hexdigest()
+    clone['short_id'] = clone['id'][:8]
+    fake.snapshots.append(clone)
+    for (sid, path), data in list(fake.files.items()):
+        if sid == snapshot_id:
+            fake.files[(clone['id'], path)] = data
+    return clone
 
 
 def make_private_dir(parent, name, mode=0o700):
@@ -823,6 +892,17 @@ class StoreTests(RepositoryFixture):
         self.assertEqual(
             hashlib.sha256(self.fake.blobs[subtree]).hexdigest(),
             subtree)
+        self.assertEqual(manifest['schemaVersion'], 3)
+        self.assertEqual(manifest['stateFormat'], 'restic-posix-v2')
+        # The anchor is the native id of the state parent's subtree
+        # blob — the tree that carries each state root's own metadata.
+        snapshot = next(s for s in self.fake.snapshots
+                        if s['id'] == record['snapshotId'])
+        state_node = next(node for node in json.loads(
+            self.fake.blobs[snapshot['tree']])['nodes']
+            if node['name'] == 'state')
+        self.assertEqual(manifest['stateSetDigest'],
+                         'sha256:' + state_node['subtree'])
         verbs = self.fake.verbs()
         self.assertEqual(verbs.count('backup'), 2)
         self.assertNotIn('check', verbs)
@@ -870,7 +950,8 @@ class StoreTests(RepositoryFixture):
         stage = self.stage()
         other = recovery.build_manifest(
             sealed(), source(), capture(completedAt=1006),
-            state_tree_digests={'data': 'sha256:' + '9' * 64})
+            state_tree_digests={'data': 'sha256:' + '9' * 64},
+            state_set_digest='sha256:' + '9' * 64)
         write_private_file(
             os.path.join(stage, 'manifest.json'),
             recovery.encode_manifest(other))
@@ -1141,6 +1222,61 @@ class StoreTests(RepositoryFixture):
         self.assertEqual(ctx.exception.code, 'repository-point-invalid')
 
 
+class StateSetTests(RepositoryFixture):
+
+    def test_state_root_mode_creates_distinct_point(self):
+        first = self.store()
+        second_stage = self.stage()
+        # Only the state root's own mode changes; the leaf subtree
+        # below it (same file bytes and metadata) is untouched.
+        os.chmod(os.path.join(second_stage, 'state', 'data'), 0o750)
+        second = self.store(stage=second_stage, capture_id='d2' * 16)
+        first_manifest = first['manifest']
+        second_manifest = second['manifest']
+        self.assertEqual(first_manifest['state'][0]['treeDigest'],
+                         second_manifest['state'][0]['treeDigest'])
+        self.assertNotEqual(first_manifest['stateSetDigest'],
+                            second_manifest['stateSetDigest'])
+        self.assertNotEqual(first_manifest['recoveryPointId'],
+                            second_manifest['recoveryPointId'])
+        records = self.repo().list_points()
+        self.assertEqual(
+            {r['manifest']['recoveryPointId'] for r in records},
+            {first_manifest['recoveryPointId'],
+             second_manifest['recoveryPointId']})
+
+    def test_state_set_anchor_mismatch_refused(self):
+        record = self.store()
+        # A correctly rehashed snapshot whose state-root mode differs
+        # carries the same manifest (same leaf digests) but a
+        # different parent tree: the anchor must catch it.
+        clone = clone_state_mode(self.fake, record['snapshotId'], 0o750)
+        with self.assertRaises(repository.RepositoryError) as ctx:
+            self.repo().inspect(clone['id'])
+        self.assertEqual(ctx.exception.code, 'repository-point-invalid')
+
+    def test_restored_root_mode_differs(self):
+        first = self.store()
+        second_stage = self.stage()
+        os.chmod(os.path.join(second_stage, 'state', 'data'), 0o750)
+        second = self.store(stage=second_stage, capture_id='d2' * 16)
+        first_dest = os.path.join(self.root, 'restored-a')
+        second_dest = os.path.join(self.root, 'restored-b')
+        self._own(os.path.join(first_dest, 'state'), ('data',))
+        self.repo().restore(first['snapshotId'], first_dest)
+        self._own(os.path.join(second_dest, 'state'), ('data',))
+        self.repo().restore(second['snapshotId'], second_dest)
+        self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(
+            first_dest, 'state', 'data')).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(
+            second_dest, 'state', 'data')).st_mode), 0o750)
+        for dest in (first_dest, second_dest):
+            with open(os.path.join(dest, 'state', 'data', 'value'),
+                      'rb') as handle:
+                self.assertEqual(handle.read(),
+                                 b'restic-canary-content')
+
+
 class ListTests(RepositoryFixture):
 
     def test_list_returns_points_sorted_and_skips_drafts(self):
@@ -1263,7 +1399,8 @@ class RestoreTests(RepositoryFixture):
             sealed(), source(generation=2), capture(),
             state_tree_digests={
                 entry['id']: entry['treeDigest']
-                for entry in record['manifest']['state']})
+                for entry in record['manifest']['state']},
+            state_set_digest=record['manifest']['stateSetDigest'])
         manifest_blob = hashlib.sha256(
             recovery.encode_manifest(record['manifest'])).hexdigest()
         fake.blobs[manifest_blob] = recovery.encode_manifest(other)
@@ -1303,6 +1440,25 @@ class RestoreTests(RepositoryFixture):
             self.repo().restore(record['snapshotId'], dest)
         self.assertEqual(ctx.exception.code, 'repository-point-invalid')
         fake._materialize = original
+
+    def test_legacy_v2_point_restored(self):
+        # A retained schema-2 / restic-posix-v1 point stays fully
+        # readable: inspect, canonical manifest round-trip and
+        # verified restore still work; no anchor is required for the
+        # caller-selected full snapshot id path.
+        record = self.store()
+        legacy = legacy_v2_manifest(record['manifest'])
+        serve_manifest(self.fake, record['snapshotId'], legacy)
+        looked = self.repo().inspect(record['snapshotId'])
+        self.assertEqual(looked['manifest'], legacy)
+        self.assertNotIn('stateSetDigest', looked['manifest'])
+        dest = os.path.join(self.root, 'restored-legacy')
+        self._own(os.path.join(dest, 'state'), ('data',))
+        result = self.repo().restore(record['snapshotId'], dest)
+        self.assertEqual(result['manifest'], legacy)
+        with open(os.path.join(dest, 'state', 'data', 'value'),
+                  'rb') as handle:
+            self.assertEqual(handle.read(), b'restic-canary-content')
 
     def test_missing_state_root_refused(self):
         record = self.store()
@@ -1491,6 +1647,61 @@ class CopyFromTests(RepositoryFixture):
         with self.assertRaises(repository.RepositoryError) as ctx:
             self.dest().copy_from(sftp, 'a' * 64)
         self.assertEqual(ctx.exception.code, 'invalid-transport')
+
+    def test_copy_same_manifest_different_state_tree_refused(self):
+        record = self.store()
+        # Downgrade the stored point to the legacy contract: valid
+        # and canonical, but it cannot bind state-root metadata.
+        legacy = legacy_v2_manifest(record['manifest'])
+        serve_manifest(self.fake, record['snapshotId'], legacy)
+        # The destination already holds a final snapshot under the
+        # same capture tag that serves the identical manifest while
+        # its state parent tree carries a different root mode (a
+        # correctly rehashed blob, not a corrupt id).
+        clone = clone_state_mode(self.fake, record['snapshotId'], 0o750)
+        self.fake.snapshots.remove(clone)
+        for key, data in self.fake.blobs.items():
+            self.dest_fake.blobs.setdefault(key, data)
+        for key, data in list(self.fake.files.items()):
+            if key[0] == clone['id']:
+                self.dest_fake.files[key] = data
+        self.dest_fake.snapshots.append(clone)
+        with self.assertRaises(repository.RepositoryError) as ctx:
+            self.dest().copy_from(
+                self.source_repo(), record['snapshotId'])
+        self.assertEqual(ctx.exception.code, 'capture-conflict')
+        # Nothing was copied.
+        self.assertFalse(
+            any('copy' in call for call in self.dest_fake.calls))
+
+    def test_copy_result_different_state_tree_refused(self):
+        record = self.store()
+        legacy = legacy_v2_manifest(record['manifest'])
+        serve_manifest(self.fake, record['snapshotId'], legacy)
+        original = self.dest_fake._cmd_copy
+
+        def tampered(argv, cwd):
+            result = original(argv, cwd)
+            copied = self.dest_fake.snapshots[-1]
+            nodes = json.loads(
+                self.dest_fake.blobs[copied['tree']])['nodes']
+            state_id = next(node['subtree'] for node in nodes
+                            if node['name'] == 'state')
+            children = [dict(node, mode=0o750)
+                        if node['name'] == 'data' else node
+                        for node in json.loads(
+                            self.dest_fake.blobs[state_id])['nodes']]
+            new_state = self.dest_fake._tree_blob(children)
+            nodes = [dict(node, subtree=new_state)
+                     if node['name'] == 'state' else node
+                     for node in nodes]
+            copied['tree'] = self.dest_fake._tree_blob(nodes)
+            return result
+        self.dest_fake._cmd_copy = tampered
+        with self.assertRaises(repository.RepositoryError) as ctx:
+            self.dest().copy_from(
+                self.source_repo(), record['snapshotId'])
+        self.assertEqual(ctx.exception.code, 'repository-point-invalid')
 
     def test_copy_corruption_detected(self):
         record = self.store()

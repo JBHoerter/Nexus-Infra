@@ -19,7 +19,8 @@ import statefiles
 import worker
 from test_catalog import sealed
 from test_repository import (CAPTURE_ID, Completed, FakeRestic,
-                             make_private_dir, write_private_file)
+                             legacy_v2_manifest, make_private_dir,
+                             write_private_file)
 
 
 INSTANCE = 'ab' * 16
@@ -971,13 +972,38 @@ class CaptureTests(BackupFixture):
             cached['definition'], cached['source'], cached['capture'],
             state_tree_digests={
                 entry['id']: 'sha256:' + 'f' * 64
-                for entry in cached['state']})
+                for entry in cached['state']},
+            state_set_digest='sha256:' + 'f' * 64)
         self.assertNotEqual(foreign['recoveryPointId'],
                             cached['recoveryPointId'])
         job['copies']['dest']['record']['manifest'] = foreign
         statefiles.write_json(self.job_path(), job)
         self.expect_blocked(self.make().execute(status_request()),
                             'journal-invalid')
+
+    def test_journal_legacy_v2_manifests_accepted(self):
+        # A retained captured journal may still carry schema-2
+        # restic-posix-v1 receipts: cache and copies holding the
+        # identical legacy manifest stay internally bound and the job
+        # remains readable; nothing is upgraded in place.
+        self.assertEqual(self.capture()['status'], 'completed')
+        self.assertEqual(
+            self.make().execute(upload_request())['status'],
+            'completed')
+        job = self.read_job()
+        legacy = legacy_v2_manifest(job['cache']['manifest'])
+        job['cache']['manifest'] = legacy
+        job['copies']['dest']['record']['manifest'] = legacy
+        statefiles.write_json(self.job_path(), job)
+        response = self.make().execute(status_request())
+        self.assertEqual(response['status'], 'completed')
+        self.assertNotIn('stateSetDigest',
+                         response['record']['manifest'])
+        self.assertNotIn(
+            'stateSetDigest',
+            response['copies'][0]['record']['manifest'])
+        self.assertEqual(
+            self.read_job()['cache']['manifest']['schemaVersion'], 2)
 
     def test_oversized_journal_preserves_old_record(self):
         self.capture()
