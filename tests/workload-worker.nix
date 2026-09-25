@@ -260,5 +260,65 @@ in { pkgs, ... }: {
         rc, observed = worker(target, {
             "schemaVersion": 1, "action": "observe", "instanceId": INSTANCE_B})
         assert observed["retired"] is True and observed["unitDrained"] is True, observed
+
+    with subtest("durable capture barrier survives power loss until matching thaw"):
+        capture = "5e" * 16
+        unit_c = "nexus-workload@" + worker_module._machine_name(INSTANCE_C) + ".service"
+        rc, result = worker(source, request("d3" * 16, "start", INSTANCE_C, 2))
+        assert result["status"] == "completed" and result["appliedPhase"] == "running", result
+        source.wait_until_succeeds("curl --fail --silent http://192.168.131.2:8080/", timeout=120)
+        source.succeed("curl --fail --silent -X PUT --data-binary capture-marker http://192.168.131.2:8080/")
+        freeze = dict(request("d4" * 16, "freeze", INSTANCE_C, 2))
+        freeze["captureId"] = capture
+        rc, result = worker(source, freeze)
+        assert result["status"] == "completed" and result["appliedPhase"] == "stopped", result
+        assert result["captureId"] == capture, result
+        rc, observed = worker(source, {
+            "schemaVersion": 1, "action": "observe", "instanceId": INSTANCE_C})
+        assert observed["captureId"] == capture, observed
+        assert observed["phase"] == "stopped" and observed["unitDrained"] is True, observed
+        rc, result = worker(source, request("d5" * 16, "start", INSTANCE_C, 2))
+        assert result["status"] == "failed" and result["error"] == "capture-held", result
+        rc, result = worker(source, request("d6" * 16, "prepare", "3d" * 16, 3))
+        assert result["status"] == "failed" and result["error"] == "capture-held", result
+        source.fail("test -e /srv/workloads/" + "3d" * 16)
+        source.execute("systemctl start " + unit_c)
+        assert source.succeed("systemctl show " + unit_c + " --property=MainPID --value").strip() == "0"
+        # Flush the marker to the dedicated disk before the hard crash;
+        # a clean container stop does not fsync the backing filesystem.
+        source.succeed("sync")
+        boot_before = source.succeed("cat /proc/sys/kernel/random/boot_id").strip()
+        source.crash()
+        source.start()
+        source.wait_for_unit("multi-user.target")
+        assert source.succeed("cat /proc/sys/kernel/random/boot_id").strip() != boot_before
+        source.succeed("systemctl start nix-daemon.socket")
+        assert source.succeed("systemctl show " + unit_c + " --property=ActiveState --value").strip() != "active"
+        source.execute("systemctl start " + unit_c)
+        assert source.succeed("systemctl show " + unit_c + " --property=MainPID --value").strip() == "0"
+        source.wait_until_succeeds(
+            "test -b /dev/disk/by-uuid/11111111-2222-3333-4444-555555555555", timeout=30)
+        source.succeed("mkdir -p /srv/workloads")
+        source.succeed("mount /dev/disk/by-uuid/11111111-2222-3333-4444-555555555555 /srv/workloads")
+        rc, observed = worker(source, {
+            "schemaVersion": 1, "action": "observe", "instanceId": INSTANCE_C})
+        assert observed["captureId"] == capture and observed["unitDrained"] is True, observed
+        wrong = dict(request("d7" * 16, "thaw", INSTANCE_C, 2))
+        wrong["captureId"] = "6f" * 16
+        rc, result = worker(source, wrong)
+        assert result["status"] == "failed" and result["error"] == "capture-missing", result
+        thaw = dict(request("d8" * 16, "thaw", INSTANCE_C, 2))
+        thaw["captureId"] = capture
+        rc, result = worker(source, thaw)
+        assert result["status"] == "completed" and result["appliedPhase"] == "stopped", result
+        assert result["captureId"] == capture, result
+        rc, observed = worker(source, {
+            "schemaVersion": 1, "action": "observe", "instanceId": INSTANCE_C})
+        assert observed["captureId"] is None and observed["phase"] == "stopped", observed
+        rc, result = worker(source, request("d9" * 16, "start", INSTANCE_C, 2))
+        assert result["status"] == "completed" and result["appliedPhase"] == "running", result
+        source.wait_until_succeeds("curl --fail --silent http://192.168.131.2:8080/", timeout=120)
+        guest = json.loads(source.succeed("curl --fail --silent http://192.168.131.2:8080/"))
+        assert guest["value"] == "capture-marker", guest
   '';
 }

@@ -39,6 +39,7 @@ _PATH_RE = re.compile(r'/[A-Za-z0-9_/.-]+')
 _NIX_BASE32_ALPHABET = '0123456789abcdfghijklmnpqrsvwxyz'
 _REQUEST_FIELDS = {'schemaVersion', 'operationId', 'action', 'workloadId',
                    'revisionDigest', 'instanceId', 'generation'}
+_CAPTURE_FIELDS = _REQUEST_FIELDS | {'captureId'}
 _OBSERVE_FIELDS = {'schemaVersion', 'action', 'instanceId'}
 _RESERVE_PHASES = ('preparing', 'prepared', 'starting', 'running', 'stopping',
                    'unknown')
@@ -325,7 +326,8 @@ def load_json_bytes(raw):
 
 
 def validate_request(request):
-    if type(request) is not dict or set(request) not in (_REQUEST_FIELDS, _OBSERVE_FIELDS):
+    if type(request) is not dict or set(request) not in (
+            _REQUEST_FIELDS, _OBSERVE_FIELDS, _CAPTURE_FIELDS):
         raise WorkerError('invalid-request-fields')
     _integer(request['schemaVersion'], 1, 1, 'schemaVersion')
     if set(request) == _OBSERVE_FIELDS:
@@ -333,13 +335,20 @@ def validate_request(request):
             raise WorkerError('invalid-action')
         _hex32(request['instanceId'], 'instanceId')
         return request['action'], request
-    if request['action'] not in ('prepare', 'start', 'stop', 'retire'):
+    expected = _CAPTURE_FIELDS \
+        if request['action'] in ('freeze', 'thaw') else _REQUEST_FIELDS
+    if set(request) != expected:
+        raise WorkerError('invalid-request-fields')
+    if request['action'] not in ('prepare', 'start', 'stop', 'retire',
+                                 'freeze', 'thaw'):
         raise WorkerError('invalid-action')
     _hex32(request['operationId'], 'operationId')
     _identifier(request['workloadId'], 'workloadId')
     _digest(request['revisionDigest'], 'revisionDigest')
     _hex32(request['instanceId'], 'instanceId')
     _integer(request['generation'], 1, _MAX_I64, 'generation')
+    if 'captureId' in request:
+        _hex32(request['captureId'], 'captureId')
     return request['action'], request
 
 
@@ -367,6 +376,15 @@ CREATE TABLE IF NOT EXISTS generations(workload_id TEXT PRIMARY KEY, generation 
 CREATE TABLE IF NOT EXISTS operations(
     operation_id TEXT PRIMARY KEY, request TEXT NOT NULL,
     status TEXT NOT NULL, result TEXT);
+CREATE TABLE IF NOT EXISTS captures(
+    capture_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    workload_id TEXT NOT NULL,
+    revision_digest TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('held','released')));
+CREATE UNIQUE INDEX IF NOT EXISTS held_workload_capture
+    ON captures(workload_id) WHERE status='held';
 '''
 
 _INTERNAL_ERRORS = (artifacts.ArtifactError, catalog.CatalogError, OSError,
@@ -626,10 +644,12 @@ class Worker(SecurePaths):
 
     def _reservation_map(self, exclude_instance=None):
         reserved = {'memoryMiB': 0, 'cpuMillis': 0, 'stateBytes': 0}
+        held = {row[0] for row in self.db.execute(
+            "SELECT instance_id FROM captures WHERE status='held'")}
         for instance_id, phase, raw in self.db.execute(
                 'SELECT instance_id, phase, requirements FROM instances'):
             req = json.loads(raw)
-            if phase in _RESERVE_PHASES:
+            if phase in _RESERVE_PHASES or instance_id in held:
                 for key in reserved:
                     reserved[key] += req.get(key, 0)
             else:
@@ -640,7 +660,8 @@ class Worker(SecurePaths):
                 req = json.loads(rec['requirements'])
                 reserved['stateBytes'] = max(
                     0, reserved['stateBytes'] - req.get('stateBytes', 0))
-                if rec['phase'] in _RESERVE_PHASES:
+                if rec['phase'] in _RESERVE_PHASES \
+                        or rec['instance_id'] in held:
                     reserved['memoryMiB'] = max(
                         0, reserved['memoryMiB'] - req.get('memoryMiB', 0))
                     reserved['cpuMillis'] = max(
@@ -967,11 +988,14 @@ class Worker(SecurePaths):
         host_id = self.config['hostId']
         if rec is not None and rec['binding'] is not None:
             host_id = rec['binding']['hostId']
-        return {'schemaVersion': 1, 'operationId': request['operationId'],
-                'action': request['action'], 'workloadId': request['workloadId'],
-                'instanceId': request['instanceId'],
-                'generation': request['generation'], 'hostId': host_id,
-                'status': status, 'appliedPhase': phase}
+        response = {'schemaVersion': 1, 'operationId': request['operationId'],
+                    'action': request['action'], 'workloadId': request['workloadId'],
+                    'instanceId': request['instanceId'],
+                    'generation': request['generation'], 'hostId': host_id,
+                    'status': status, 'appliedPhase': phase}
+        if request['action'] in ('freeze', 'thaw'):
+            response['captureId'] = request['captureId']
+        return response
 
     def _finish(self, request, status, phase, error=None):
         response = self._receipt(request, status, phase)
@@ -1009,6 +1033,10 @@ class Worker(SecurePaths):
                 return self._start(request)
             if request['action'] == 'retire':
                 return self._retire(request)
+            if request['action'] == 'freeze':
+                return self._freeze(request)
+            if request['action'] == 'thaw':
+                return self._thaw(request)
             return self._stop(request)
         except UncertainError as error:
             return self._uncertain(request, error.code)
@@ -1028,6 +1056,10 @@ class Worker(SecurePaths):
                 return self._resume_start(request)
             if request['action'] == 'retire':
                 return self._resume_retire(request)
+            if request['action'] == 'freeze':
+                return self._resume_freeze(request)
+            if request['action'] == 'thaw':
+                return self._resume_thaw(request)
             return self._resume_stop(request)
         except UncertainError as error:
             return self._uncertain(request, error.code)
@@ -1104,6 +1136,56 @@ class Worker(SecurePaths):
         if known is None or rec['generation'] != known[0]:
             raise WorkerError('generation-stale')
 
+    def _capture_row(self, capture_id):
+        row = self.db.execute(
+            'SELECT capture_id, instance_id, workload_id, revision_digest,'
+            ' generation, status FROM captures WHERE capture_id=?',
+            (capture_id,)).fetchone()
+        if row is None:
+            return None
+        keys = ('capture_id', 'instance_id', 'workload_id', 'revision_digest',
+                'generation', 'status')
+        return dict(zip(keys, row))
+
+    def _held_capture(self, workload_id):
+        row = self.db.execute(
+            'SELECT capture_id, instance_id, workload_id, revision_digest,'
+            " generation, status FROM captures"
+            " WHERE workload_id=? AND status='held'",
+            (workload_id,)).fetchone()
+        if row is None:
+            return None
+        keys = ('capture_id', 'instance_id', 'workload_id', 'revision_digest',
+                'generation', 'status')
+        return dict(zip(keys, row))
+
+    def _capture_id_of(self, instance_id):
+        row = self.db.execute(
+            "SELECT capture_id FROM captures"
+            " WHERE instance_id=? AND status='held'",
+            (instance_id,)).fetchone()
+        return row[0] if row else None
+
+    def _capture_matches(self, row, rec):
+        return (row['instance_id'], row['workload_id'],
+                row['revision_digest'], row['generation']) == (
+                    rec['instance_id'], rec['workload_id'],
+                    rec['revision_digest'], rec['generation'])
+
+    def _capture_context(self, request):
+        rec = self._get_instance(request['instanceId'])
+        self._check_identity(rec, request)
+        self._require_binding_current(rec)
+        bundle, manifest, definition = self._resolve(
+            rec['workload_id'], rec['revision_digest'])
+        self._check_action_allowed(definition, 'stop')
+        if 'backup' not in definition['allowedOperations']:
+            raise WorkerError('operation-not-allowed')
+        self._check_bundle_host(manifest, definition)
+        self._verify_mount()
+        self._check_state_dirs(rec, definition, rec['binding']['slot'])
+        return rec, definition
+
     def _set_highest_generation(self, workload_id, generation):
         self.db.execute(
             'INSERT INTO generations(workload_id, generation) VALUES(?,?)'
@@ -1133,6 +1215,9 @@ class Worker(SecurePaths):
                 raise WorkerError('generation-stale')
         self._check_bundle_host(manifest, definition)
         self._check_action_allowed(definition, 'prepare')
+        held = rec['workload_id'] if resume else request['workloadId']
+        if self._held_capture(held) is not None:
+            raise WorkerError('capture-held')
         probe = self._verify_mount()
         self._verify_closure(manifest)
         self._admission(definition,
@@ -1219,6 +1304,8 @@ class Worker(SecurePaths):
         self._check_bundle_host(manifest, definition)
         self._check_action_allowed(definition, 'start')
         self._check_generation_current(rec)
+        if self._held_capture(rec['workload_id']) is not None:
+            raise WorkerError('capture-held')
         unit = self._unit_of(rec)
         if rec['phase'] == 'running':
             show = self._show(unit)
@@ -1264,6 +1351,8 @@ class Worker(SecurePaths):
         self._check_identity(rec, request)
         if rec['retired']:
             raise WorkerError('instance-retired')
+        if self._held_capture(rec['workload_id']) is not None:
+            raise WorkerError('capture-held')
         unit = self._unit_of(rec)
         if rec['phase'] == 'prepared':
             return self._start(request)
@@ -1401,6 +1490,73 @@ class Worker(SecurePaths):
             return self._retire(request)
         return self._resume_stop(request)
 
+    def _freeze(self, request):
+        rec, definition = self._capture_context(request)
+        self._check_generation_current(rec)
+        row = self._capture_row(request['captureId'])
+        if row is not None:
+            if not self._capture_matches(row, rec):
+                raise WorkerError('capture-conflict')
+            if row['status'] == 'released':
+                raise WorkerError('capture-released')
+            return self._resume_freeze(request)
+        if self._held_capture(rec['workload_id']) is not None:
+            raise WorkerError('capture-conflict')
+        if rec['phase'] not in ('running', 'stopped'):
+            raise WorkerError('phase-conflict')
+        self.db.execute(
+            "INSERT INTO captures(capture_id, instance_id, workload_id,"
+            " revision_digest, generation, status)"
+            " VALUES(?,?,?,?,?,'held')",
+            (request['captureId'], rec['instance_id'], rec['workload_id'],
+             rec['revision_digest'], rec['generation']))
+        self.db.execute(
+            "UPDATE instances SET permit=0, phase='stopping'"
+            " WHERE instance_id=?",
+            (rec['instance_id'],))
+        self.db.commit()
+        rec = self._get_instance(request['instanceId'])
+        return self._settle_stop(request, rec, self._issue_stop(rec))
+
+    def _resume_freeze(self, request):
+        rec, definition = self._capture_context(request)
+        self._check_generation_current(rec)
+        row = self._capture_row(request['captureId'])
+        if row is None:
+            return self._freeze(request)
+        if not self._capture_matches(row, rec):
+            raise WorkerError('capture-conflict')
+        if row['status'] == 'released':
+            raise WorkerError('capture-released')
+        return self._resume_stop(request)
+
+    def _thaw(self, request):
+        rec, definition = self._capture_context(request)
+        row = self._capture_row(request['captureId'])
+        if row is None:
+            raise WorkerError('capture-missing')
+        if not self._capture_matches(row, rec):
+            raise WorkerError('capture-conflict')
+        if row['status'] == 'released':
+            return self._finish(request, 'completed', rec['phase'])
+        if rec['phase'] == 'unknown':
+            raise UncertainError()
+        if rec['phase'] != 'stopped' or rec['permit']:
+            raise WorkerError('phase-conflict')
+        drained = self._unit_drained(self._show(self._unit_of(rec)))
+        if drained is False:
+            raise WorkerError('phase-conflict')
+        if drained is not True:
+            raise UncertainError()
+        self.db.execute(
+            "UPDATE captures SET status='released' WHERE capture_id=?"
+            " AND status='held'", (request['captureId'],))
+        self.db.commit()
+        return self._finish(request, 'completed', 'stopped')
+
+    def _resume_thaw(self, request):
+        return self._thaw(request)
+
     def _observe(self, request):
         rec = self._get_instance(request['instanceId'])
         if rec is None:
@@ -1425,6 +1581,7 @@ class Worker(SecurePaths):
             'phase': rec['phase'],
             'retired': bool(rec['retired']),
             'unitDrained': self._unit_drained(show),
+            'captureId': self._capture_id_of(rec['instance_id']),
             'endpointAddress': slot['localAddress'] if slot else None,
         }
 
@@ -1457,6 +1614,8 @@ class Worker(SecurePaths):
                 return 1
             rec = self._get_instance(instance_id)
             self._require_binding_current(rec)
+            if self._held_capture(rec['workload_id']) is not None:
+                return 1
             bundle, manifest, definition = self._resolve(
                 rec['workload_id'], rec['revision_digest'])
             self._check_bundle_host(manifest, definition)
@@ -1469,9 +1628,11 @@ class Worker(SecurePaths):
                 'UPDATE instances SET permit=0 WHERE instance_id=? AND permit=1'
                 ' AND phase=? AND boot_id=? AND permit_deadline>?'
                 ' AND generation=(SELECT generation FROM generations'
-                '  WHERE workload_id=?)',
+                '  WHERE workload_id=?)'
+                " AND NOT EXISTS (SELECT 1 FROM captures WHERE workload_id=?"
+                "   AND status='held')",
                 (instance_id, 'starting', boot_id, self.clock.monotonic(),
-                 rec['workload_id']))
+                 rec['workload_id'], rec['workload_id']))
             self.db.commit()
             return 0 if consumed.rowcount == 1 else 1
         except Exception:

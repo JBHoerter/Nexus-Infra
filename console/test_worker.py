@@ -2547,5 +2547,414 @@ class OrphanRuntimeTests(unittest.TestCase):
             self.assertIsNone(instance._get_instance('3d' * 16))
 
 
+class CaptureBarrierTests(unittest.TestCase):
+    def _running(self, tmp, fs=None, definition_overrides=None):
+        instance, runner, fs, clock, definition, _ = make_worker(
+            tmp, fs=fs, definition_overrides=definition_overrides)
+        digest = definition['revisionDigest']
+        instance.execute(request('prepare', revisionDigest=digest))
+        instance.execute(request('start', op='bb' * 16,
+                                 revisionDigest=digest))
+        return instance, runner, fs, clock, digest
+
+    def _reopen(self, instance, runner, fs, clock, boot_id='test-boot-id'):
+        instance2 = new_worker(
+            instance.config, runner=runner, fs=fs, clock=clock,
+            boot_id=boot_id, unit_dir=instance.unit_dir)
+        runner.owner = instance2
+        return instance2
+
+    def _freeze(self, digest, token='5e' * 16, op='dd' * 16,
+                instance='0a' * 16, generation=1):
+        req = request('freeze', instance=instance, op=op,
+                      generation=generation, revisionDigest=digest,
+                      captureId=token)
+        return req
+
+    def _thaw(self, digest, token='5e' * 16, op='ee' * 16,
+              instance='0a' * 16, generation=1):
+        req = request('thaw', instance=instance, op=op,
+                      generation=generation, revisionDigest=digest,
+                      captureId=token)
+        return req
+
+    def test_freeze_thaw_request_shape(self):
+        req = self._freeze('sha256:' + '0' * 64)
+        action, parsed = worker.validate_request(req)
+        self.assertEqual(action, 'freeze')
+        req = self._thaw('sha256:' + '0' * 64)
+        action, _ = worker.validate_request(req)
+        self.assertEqual(action, 'thaw')
+        for mutate in (
+            lambda r: r.pop('captureId'),
+            lambda r: r.update(captureId='5E' * 16),
+            lambda r: r.update(captureId='5e' * 15),
+            lambda r: r.update(captureId='not-hex'),
+            lambda r: r.update(extra='x'),
+        ):
+            bad = self._freeze('sha256:' + '0' * 64)
+            mutate(bad)
+            with self.assertRaises(worker.WorkerError, msg=mutate):
+                worker.validate_request(bad)
+        bad = request('start', revisionDigest='sha256:' + '0' * 64,
+                      captureId='5e' * 16)
+        with self.assertRaises(worker.WorkerError):
+            worker.validate_request(bad)
+        bad = request('freeze', revisionDigest='sha256:' + '0' * 64)
+        with self.assertRaises(worker.WorkerError):
+            worker.validate_request(bad)
+
+    def test_freeze_running_drains_and_holds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            machine = worker._machine_name('0a' * 16)
+            unit = 'nexus-workload@' + machine + '.service'
+            result = instance.execute(self._freeze(digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'stopped')
+            self.assertEqual(result['captureId'], '5e' * 16)
+            observed = instance.execute(observe())
+            self.assertEqual(observed['captureId'], '5e' * 16)
+            self.assertTrue(observed['unitDrained'])
+            self.assertEqual(observed['phase'], 'stopped')
+            self.assertEqual(runner.unit_state(unit)['ActiveState'],
+                             'inactive')
+
+    def test_freeze_stopped_instance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(request('stop', op='cc' * 16,
+                                     revisionDigest=digest))
+            result = instance.execute(self._freeze(digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'stopped')
+            self.assertEqual(instance.execute(observe())['captureId'],
+                             '5e' * 16)
+
+    def test_plain_stop_is_not_a_barrier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            result = instance.execute(request(
+                'stop', op='cc' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed')
+            self.assertIsNone(instance.execute(observe())['captureId'])
+            result = instance.execute(request(
+                'start', op='dd' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'running')
+
+    def test_held_blocks_start_guard_and_new_prepare(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(self._freeze(digest))
+            result = instance.execute(request(
+                'start', op='e1' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'capture-held')
+            set_pending_start(instance, clock)
+            machine = worker._machine_name('0a' * 16)
+            self.assertEqual(instance.guard(machine), 1)
+            self.assertEqual(instance._get_instance('0a' * 16)['permit'], 1)
+            newer = request('prepare', instance='3d' * 16, op='e2' * 16,
+                            generation=2, revisionDigest=digest)
+            result = instance.execute(newer)
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'capture-held')
+            self.assertIsNone(instance._get_instance('3d' * 16))
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, 'storage', '3d' * 16)))
+
+    def test_conflicting_and_released_capture_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(self._freeze(digest))
+            result = instance.execute(self._freeze(
+                digest, token='6f' * 16, op='e1' * 16))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'capture-conflict')
+            result = instance.execute(self._thaw(
+                digest, token='6f' * 16, op='e2' * 16))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'capture-missing')
+            result = instance.execute(self._thaw(digest))
+            self.assertEqual(result['status'], 'completed', result)
+            result = instance.execute(self._freeze(
+                digest, op='e3' * 16))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'capture-released')
+            result = instance.execute(self._freeze(
+                digest, token='6f' * 16, op='e4' * 16))
+            self.assertEqual(result['status'], 'completed', result)
+            result = instance.execute(self._thaw(
+                digest, op='e5' * 16))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(instance.execute(observe())['captureId'],
+                             '6f' * 16)
+            result = instance.execute(request(
+                'start', op='e6' * 16, revisionDigest=digest))
+            self.assertEqual(result['error'], 'capture-held')
+
+    def test_thaw_mismatch_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(self._freeze(digest))
+            result = instance.execute(self._thaw(
+                digest, generation=2))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'instance-conflict')
+            result = instance.execute(self._thaw(
+                'sha256:' + '0' * 64, op='e7' * 16))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'instance-conflict')
+
+    def test_thaw_leaves_stopped_until_explicit_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(self._freeze(digest))
+            result = instance.execute(self._thaw(digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'stopped')
+            self.assertEqual(result['captureId'], '5e' * 16)
+            observed = instance.execute(observe())
+            self.assertIsNone(observed['captureId'])
+            self.assertEqual(observed['phase'], 'stopped')
+            machine = worker._machine_name('0a' * 16)
+            unit = 'nexus-workload@' + machine + '.service'
+            self.assertEqual(runner.unit_state(unit)['ActiveState'],
+                             'inactive')
+            result = instance.execute(request(
+                'start', op='e8' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'running')
+
+    def test_retired_survives_freeze_thaw(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(request('retire', op='cc' * 16,
+                                     revisionDigest=digest))
+            result = instance.execute(self._freeze(digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertTrue(instance.execute(observe())['retired'])
+            result = instance.execute(self._thaw(digest))
+            self.assertEqual(result['status'], 'completed', result)
+            observed = instance.execute(observe())
+            self.assertTrue(observed['retired'])
+            self.assertIsNone(observed['captureId'])
+            result = instance.execute(request(
+                'start', op='e9' * 16, revisionDigest=digest))
+            self.assertEqual(result['error'], 'instance-retired')
+
+    def test_freeze_requires_backup_and_stop(self):
+        for overrides, code in (
+            ({'allowedOperations': ['start', 'stop']},
+             'operation-not-allowed'),
+            ({'allowedOperations': ['start', 'backup']},
+             'operation-not-allowed'),
+            ({'secretSetRef': 'sec'}, 'secret-provisioning-unavailable'),
+            ({'dependencies': ['other']},
+             'dependency-readiness-unavailable'),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                instance, runner, fs, clock, definition, _ = make_worker(
+                    tmp, definition_overrides=overrides)
+                digest = definition['revisionDigest']
+                insert_instance(instance, digest, phase='stopped')
+                result = instance.execute(self._freeze(digest))
+                self.assertEqual(result['status'], 'failed')
+                self.assertEqual(result['error'], code, overrides)
+
+    def test_freeze_requires_prepared_phase_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            instance.execute(request('prepare', revisionDigest=digest))
+            result = instance.execute(self._freeze(digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'phase-conflict')
+            self.assertIsNone(instance.execute(observe())['captureId'])
+
+    def test_freeze_refuses_unsafe_surfaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            runner.mount_rc = 1
+            result = instance.execute(self._freeze(digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'storage-not-mounted')
+            self.assertIsNone(instance.execute(observe())['captureId'])
+            runner.mount_rc = 0
+            instance.config['storage']['uuid'] = 'drifted-uuid'
+            result = instance.execute(self._freeze(digest, op='e1' * 16))
+            self.assertEqual(result['error'], 'binding-changed')
+            instance.config['storage']['uuid'] = '1111-2222'
+            storage = instance.config['storage']['root']
+            instance_dir = os.path.join(storage, '0a' * 16)
+            shutil.rmtree(instance_dir)
+            result = instance.execute(self._freeze(digest, op='e2' * 16))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'path-unsafe')
+            os.mkdir(instance_dir, 0o700)
+            os.mkdir(os.path.join(instance_dir, 'foreign'))
+            result = instance.execute(self._freeze(digest, op='e3' * 16))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'storage-state-conflict')
+
+    def test_stop_query_unknown_keeps_barrier_uncertain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            runner.show_mode = 'rc'
+            result = instance.execute(self._freeze(digest))
+            self.assertEqual(result['status'], 'uncertain', result)
+            rec = instance._get_instance('0a' * 16)
+            self.assertEqual(rec['phase'], 'unknown')
+            self.assertIsNotNone(instance._held_capture('canary'))
+            result = instance.execute(request(
+                'start', op='ea' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'uncertain')
+            self.assertEqual(result['error'], 'operation-in-progress')
+            runner.show_mode = 'ok'
+            result = instance.execute(request(
+                'start', op='eb' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'capture-held')
+
+    def test_crash_after_barrier_commit_resumes_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            freeze = self._freeze(digest)
+            runner.crash_after = 'stop'
+            with self.assertRaises(KeyboardInterrupt):
+                instance.execute(freeze)
+            row = instance.db.execute(
+                'SELECT status FROM operations WHERE operation_id=?',
+                ('dd' * 16,)).fetchone()
+            self.assertEqual(row[0], 'pending')
+            instance2 = self._reopen(instance, runner, fs, clock,
+                                     boot_id='new-boot-id')
+            self.assertIsNotNone(instance2._held_capture('canary'))
+            result = instance2.execute(freeze)
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'stopped')
+            observed = instance2.execute(observe())
+            self.assertEqual(observed['captureId'], '5e' * 16)
+            self.assertTrue(observed['unitDrained'])
+            result = instance2.execute(request(
+                'start', op='ec' * 16, revisionDigest=digest))
+            self.assertEqual(result['error'], 'capture-held')
+
+    def test_crash_after_release_replays_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(self._freeze(digest))
+            thaw = self._thaw(digest)
+            instance.db.execute(
+                "INSERT INTO operations(operation_id, request, status)"
+                " VALUES(?,?,'pending')",
+                (thaw['operationId'],
+                 artifacts.canonical_bytes(thaw).decode()))
+            instance.db.execute(
+                "UPDATE captures SET status='released'"
+                " WHERE capture_id=?", ('5e' * 16,))
+            instance.db.commit()
+            result = instance.execute(thaw)
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'stopped')
+            self.assertIsNone(instance.execute(observe())['captureId'])
+
+    def test_held_survives_reopen_and_boot_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(self._freeze(digest))
+            instance2 = self._reopen(instance, runner, fs, clock,
+                                     boot_id='new-boot-id')
+            observed = instance2.execute(observe())
+            self.assertEqual(observed['captureId'], '5e' * 16)
+            result = instance2.execute(request(
+                'start', op='ed' * 16, revisionDigest=digest))
+            self.assertEqual(result['error'], 'capture-held')
+            set_pending_start(instance2, clock)
+            self.assertEqual(
+                instance2.guard(worker._machine_name('0a' * 16)), 1)
+
+    def test_held_capture_retains_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(request('stop', op='cc' * 16,
+                                     revisionDigest=digest))
+            reserved = instance._reservation_map()
+            self.assertEqual(reserved['memoryMiB'], 0)
+            self.assertEqual(reserved['cpuMillis'], 0)
+            self.assertEqual(reserved['stateBytes'], 1048576)
+            instance.execute(self._freeze(digest))
+            reserved = instance._reservation_map()
+            self.assertEqual(reserved['memoryMiB'], 256)
+            self.assertEqual(reserved['cpuMillis'], 100)
+            self.assertEqual(reserved['stateBytes'], 1048576)
+            instance.execute(self._thaw(digest))
+            reserved = instance._reservation_map()
+            self.assertEqual(reserved['memoryMiB'], 0)
+            self.assertEqual(reserved['cpuMillis'], 0)
+
+    def test_old_database_gains_captures_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, bundle = make_config(tmp)
+            state = config['stateDir']
+            os.makedirs(state, 0o700)
+            os.chmod(state, 0o700)
+            db_path = os.path.join(state, 'worker.db')
+            os.makedirs(os.path.join(state, 'instances'), 0o700)
+            db = __import__('sqlite3').connect(db_path)
+            db.executescript(
+                'CREATE TABLE instances(instance_id TEXT PRIMARY KEY,'
+                ' workload_id TEXT NOT NULL, revision_digest TEXT NOT NULL,'
+                ' generation INTEGER NOT NULL, slot_id TEXT NOT NULL UNIQUE,'
+                ' machine_name TEXT NOT NULL UNIQUE, phase TEXT NOT NULL,'
+                " requirements TEXT NOT NULL DEFAULT '{}',"
+                ' binding_json TEXT, boot_id TEXT, permit_deadline REAL,'
+                ' permit INTEGER NOT NULL DEFAULT 0,'
+                ' retired INTEGER NOT NULL DEFAULT 0);'
+                'CREATE TABLE generations(workload_id TEXT PRIMARY KEY,'
+                ' generation INTEGER NOT NULL);'
+                'CREATE TABLE operations(operation_id TEXT PRIMARY KEY,'
+                ' request TEXT NOT NULL, status TEXT NOT NULL, result TEXT);')
+            db.commit()
+            db.close()
+            os.chmod(db_path, 0o600)
+            write_bundle(bundle)
+            instance = new_worker(
+                config, runner=FakeRunner(),
+                fs=FakeFilesystem(bundle_dir=bundle), clock=FakeClock(),
+                boot_id='b', unit_dir=os.path.join(tmp, 'units'))
+            self.assertEqual(instance.db.execute(
+                'SELECT COUNT(*) FROM captures').fetchone()[0], 0)
+
+    def test_released_thaw_new_op_reports_current_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, digest = self._running(tmp)
+            instance.execute(self._freeze(digest))
+            result = instance.execute(self._thaw(digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'stopped')
+            start = request('start', op='e8' * 16, revisionDigest=digest)
+            result = instance.execute(start)
+            self.assertEqual(result['appliedPhase'], 'running', result)
+            machine = worker._machine_name('0a' * 16)
+            unit = 'nexus-workload@' + machine + '.service'
+            pid = runner.unit_state(unit)['MainPID']
+            # A new-operationId thaw replaying the spent token is a
+            # no-op: it reports the recorded phase, stops nothing and
+            # leaves the running unit and released barrier untouched.
+            stops = [c for c in runner.calls if c[2:3] == ['stop']]
+            result = instance.execute(self._thaw(digest, op='e9' * 16))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'running')
+            self.assertEqual(runner.unit_state(unit)['MainPID'], pid)
+            self.assertEqual(runner.unit_state(unit)['ActiveState'],
+                             'active')
+            self.assertIsNone(instance.execute(observe())['captureId'])
+            self.assertEqual(
+                len([c for c in runner.calls if c[2:3] == ['stop']]),
+                len(stops))
+
+
 if __name__ == '__main__':
     unittest.main()
