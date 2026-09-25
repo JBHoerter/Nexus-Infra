@@ -23,6 +23,7 @@
       nexus-agent = import ./host-modules/nexus-agent.nix;
       nexus-console = import ./vm-modules/console.nix;
       workload-host = import ./host-modules/workload-host.nix;
+      workload-backup = import ./host-modules/workload-backup.nix;
       workload-artifacts = import ./host-modules/workload-artifacts.nix;
       workload-registry = import ./host-modules/workload-registry.nix;
       workload-ingress = import ./host-modules/workload-ingress.nix;

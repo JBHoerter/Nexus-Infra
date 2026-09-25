@@ -71,6 +71,13 @@ in {
       default = [ ];
       description = "Slot records {id,uidBase,hostAddress,localAddress} bound per workload instance.";
     };
+    configFile = lib.mkOption {
+      type = lib.types.path;
+      internal = true;
+      readOnly = true;
+      default = configJson;
+      description = "The exact worker configuration JSON the nexus-worker wrapper executes; exposed read-only so related components pin the identical file.";
+    };
   };
 
   config = lib.mkIf cfg.enable {

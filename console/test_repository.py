@@ -64,6 +64,10 @@ class FakeRestic:
         self.stdout_override = {}
         self.node_uid = 65536
         self.node_gid = 65536
+        self.checks = 0
+        self.sources = {}
+        self.password_content = None
+        self.copy_id_suffix = 0
         self.omit_manifest = False
         self.no_final_tag = False
         self.no_draft_tag = False
@@ -275,7 +279,44 @@ class FakeRestic:
         return Completed(0, b'restored\n')
 
     def _cmd_check(self, argv, cwd):
+        self.checks += 1
         return Completed(0, b'no errors were found\n')
+
+    def _cmd_copy(self, argv, cwd):
+        index = argv.index('copy')
+        args = argv[index + 1:]
+        source_path = args[args.index('--from-repo') + 1]
+        password_path = args[args.index('--from-password-file') + 1]
+        snapshot_id = args[-1]
+        source = self.sources.get(source_path)
+        if source is None:
+            return Completed(10, b'', b'unknown source repository')
+        if source.password_content is not None:
+            try:
+                with open(password_path, 'rb') as handle:
+                    supplied = handle.read()
+            except OSError:
+                return Completed(12, b'', b'password file unavailable')
+            if supplied != source.password_content:
+                return Completed(12, b'', b'wrong password')
+        snapshot = next((entry for entry in source.snapshots
+                         if entry['id'] == snapshot_id), None)
+        if snapshot is None:
+            return Completed(1, b'', b'snapshot not found')
+        self.copy_id_suffix += 1
+        copied = dict(snapshot)
+        copied['original'] = snapshot_id
+        copied['id'] = hashlib.sha256(
+            ('copied:' + snapshot_id + ':' + self.repo_id + ':'
+             + str(self.copy_id_suffix)).encode()).hexdigest()
+        copied['short_id'] = copied['id'][:8]
+        self.snapshots.append(copied)
+        for key, data in source.blobs.items():
+            self.blobs.setdefault(key, data)
+        for (sid, path), data in source.files.items():
+            if sid == snapshot_id:
+                self.files[(copied['id'], path)] = data
+        return Completed(0, b'copied 1 snapshots\n')
 
 
 def make_private_dir(parent, name, mode=0o700):
@@ -1299,6 +1340,169 @@ class InspectTests(RepositoryFixture):
             with self.subTest(bad=bad):
                 with self.assertRaises(repository.RepositoryError):
                     self.repo().inspect(bad)
+
+
+class CaptureFinishedTests(RepositoryFixture):
+
+    def test_callback_result_binds_manifest(self):
+        stage = self.stage()
+        finished = []
+        supplied = capture(completedAt=7777)
+
+        def callback():
+            finished.append('called')
+            return supplied
+
+        record = self.repo().store(
+            stage, sealed(), source(), capture(), capture_id=CAPTURE_ID,
+            capture_finished=callback)
+        self.assertEqual(finished, ['called'])
+        self.assertEqual(record['manifest']['capture'], supplied)
+        self.assertNotEqual(
+            record['manifest']['capture']['completedAt'],
+            capture()['completedAt'])
+
+    def test_callback_failure_blocks_final_tag(self):
+        stage = self.stage()
+
+        def callback():
+            raise BackupBoom()
+
+        class BackupBoom(Exception):
+            pass
+
+        with self.assertRaises(repository.RepositoryError) as ctx:
+            self.repo().store(stage, sealed(), source(), capture(),
+                              capture_id=CAPTURE_ID,
+                              capture_finished=callback)
+        self.assertEqual(ctx.exception.code,
+                         'capture-checkpoint-failed')
+        for snapshot in self.fake.snapshots:
+            self.assertNotIn(FINAL_TAG, snapshot['tags'])
+        self.assertFalse(os.path.exists(
+            os.path.join(stage, 'manifest.json')))
+
+
+class CopyFromTests(RepositoryFixture):
+
+    def setUp(self):
+        super().setUp()
+        self.dest_dir = make_private_dir(self.root, 'dest-repo')
+        self.dest_password = write_private_file(
+            os.path.join(self.private, 'dest-password'),
+            b'destination-key')
+        self.dest_fake = FakeRestic(repo_id='d' * 64)
+        self.dest_fake.sources = {self.repo_dir: self.fake}
+        self.dest_fake.password_content = None
+
+    def dest(self):
+        config = self.config(
+            id='repo-b', repositoryIdentity=self.dest_fake.repo_id,
+            passwordFile=self.dest_password,
+            transport={'kind': 'local', 'path': self.dest_dir})
+        return repository.ResticRepository(
+            config, runner=self.dest_fake)
+
+    def source_repo(self):
+        return self.repo()
+
+    def test_copy_to_empty_destination(self):
+        record = self.store()
+        copied = self.dest().copy_from(
+            self.source_repo(), record['snapshotId'])
+        self.assertNotEqual(
+            copied['snapshotId'], record['snapshotId'])
+        self.assertEqual(copied['repositoryId'], 'repo-b')
+        self.assertEqual(copied['manifest'], record['manifest'])
+        copies = [call for call in self.dest_fake.calls
+                  if 'copy' in call]
+        self.assertEqual(len(copies), 1)
+        argv = copies[0]
+        verb_index = argv.index('copy')
+        self.assertIn('--from-repo', argv)
+        self.assertIn('--from-password-file', argv)
+        self.assertIn(record['snapshotId'], argv[verb_index:])
+        self.assertGreaterEqual(self.dest_fake.checks, 1)
+
+    def test_copy_replay_returns_existing(self):
+        record = self.store()
+        first = self.dest().copy_from(
+            self.source_repo(), record['snapshotId'])
+        second = self.dest().copy_from(
+            self.source_repo(), record['snapshotId'])
+        self.assertEqual(second, first)
+        copy_calls = [call for call in self.dest_fake.calls
+                      if 'copy' in call]
+        self.assertEqual(len(copy_calls), 1)
+        self.assertGreaterEqual(self.dest_fake.checks, 2)
+
+    def test_copy_conflict_refused(self):
+        record = self.store()
+        # A final snapshot under the same capture tag whose manifest
+        # is valid but different must be a conflict, not an upload.
+        self.dest().store(self.stage(), sealed(), source(),
+                          capture(completedAt=9999),
+                          capture_id=CAPTURE_ID)
+        with self.assertRaises(repository.RepositoryError) as ctx:
+            self.dest().copy_from(
+                self.source_repo(), record['snapshotId'])
+        self.assertEqual(ctx.exception.code, 'capture-conflict')
+
+    def test_copy_wrong_source_key_refused(self):
+        record = self.store()
+        self.fake.password_content = b'source-key'
+        with self.assertRaises(repository.RepositoryError) as ctx:
+            self.dest().copy_from(
+                self.source_repo(), record['snapshotId'])
+        self.assertEqual(ctx.exception.code,
+                         'repository-key-unavailable')
+
+    def test_copy_source_identity_checked(self):
+        record = self.store()
+        source_repo = self.source_repo()
+        self.fake.repo_id = 'e' * 64
+        with self.assertRaises(repository.RepositoryError) as ctx:
+            self.dest().copy_from(
+                source_repo, record['snapshotId'])
+        self.assertEqual(ctx.exception.code,
+                         'repository-identity-mismatch')
+        self.assertFalse(
+            any('copy' in call for call in self.dest_fake.calls))
+
+    def test_copy_missing_snapshot_refused(self):
+        self.store()
+        with self.assertRaises(repository.RepositoryError) as ctx:
+            self.dest().copy_from(
+                self.source_repo(), 'f' * 64)
+        self.assertEqual(ctx.exception.code,
+                         'repository-command-failed')
+
+    def test_copy_draft_snapshot_refused(self):
+        self.store()
+        draft = next(s for s in self.fake.snapshots
+                     if FINAL_TAG not in s['tags'])
+        with self.assertRaises(repository.RepositoryError) as ctx:
+            self.dest().copy_from(self.source_repo(), draft['id'])
+        self.assertEqual(ctx.exception.code,
+                         'repository-point-invalid')
+
+    def test_copy_sftp_source_refused(self):
+        sftp = self.repo(self.sftp_config())
+        with self.assertRaises(repository.RepositoryError) as ctx:
+            self.dest().copy_from(sftp, 'a' * 64)
+        self.assertEqual(ctx.exception.code, 'invalid-transport')
+
+    def test_copy_corruption_detected(self):
+        record = self.store()
+        dest = self.dest()
+        copied = dest.copy_from(
+            self.source_repo(), record['snapshotId'])
+        # Corrupting the copied manifest makes the next replay fail
+        # inspection rather than return stale success.
+        for key in list(self.dest_fake.files):
+            self.dest_fake.files[key] = b'not-json-manifest'
+        with self.assertRaises(repository.RepositoryError):
+            dest.copy_from(self.source_repo(), record['snapshotId'])
 
 
 if __name__ == '__main__':

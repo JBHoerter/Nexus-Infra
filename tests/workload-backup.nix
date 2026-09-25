@@ -57,13 +57,26 @@ in { pkgs, lib, ... }: {
       environment.systemPackages = [ pkgs.openssh pkgs.restic ];
       networking.firewall.allowedTCPPorts = [ 22 ];
     };
-    source = clientNode {
-      hostId = "host-a";
-      uuid = "11111111-2222-3333-4444-555555555555";
-      slots = [
-        { id = "first"; uidBase = 65536; hostAddress = "192.168.130.1"; localAddress = "192.168.130.2"; }
-        { id = "second"; uidBase = 131072; hostAddress = "192.168.131.1"; localAddress = "192.168.131.2"; }
+    source = { pkgs, config, ... }: {
+      imports = [
+        (clientNode {
+          hostId = "host-a";
+          uuid = "11111111-2222-3333-4444-555555555555";
+          slots = [
+            { id = "first"; uidBase = 65536; hostAddress = "192.168.130.1"; localAddress = "192.168.130.2"; }
+            { id = "second"; uidBase = 131072; hostAddress = "192.168.131.1"; localAddress = "192.168.131.2"; }
+          ];
+        })
+        ../host-modules/workload-backup.nix
       ];
+      services.nexus-workload-backup = {
+        enable = true;
+        configurationFile = "/run/backup-config.json";
+      };
+      # The test reads the pinned admin worker config through this
+      # indirection instead of discovering files in the store.
+      environment.etc."nexus-worker-config-path".text =
+        "${config.services.nexus-workload-worker.configFile}\n";
     };
     target = clientNode {
       hostId = "host-b";
@@ -82,8 +95,10 @@ in { pkgs, lib, ... }: {
     INSTANCE_A = "0a" * 16
     CAPTURE = "c1" * 16
     PRIVATE = "/root/backup-private"
-    STAGE = "/root/capture-stage"
     MARKER = "backup-canary-marker"
+    LIVE_MARKER = "post-thaw-live-marker"
+    CACHE_REPO = "/var/lib/nexus-backup-cache"
+    BACKUP_CONFIG = "/run/backup-config.json"
 
     def worker(node, request):
         rc, output = node.execute("printf %s " + shlex.quote(json.dumps(request))
@@ -109,6 +124,18 @@ in { pkgs, lib, ... }: {
             + " | python3 ${repoLib pkgs}/repository-cli.py")
         return rc, json.loads(output)
 
+    def backup(node, request):
+        rc, output = node.execute(
+            "printf %s " + shlex.quote(json.dumps(request))
+            + " | nexus-backup execute")
+        return rc, json.loads(output)
+
+    def backup_request(action, **fields):
+        request = {"schemaVersion": 1, "action": action,
+                   "captureId": CAPTURE}
+        request.update(fields)
+        return request
+
     def expect_failed(node, payload, code=None):
         rc, result = cli(node, payload)
         assert result["status"] == "failed", result
@@ -120,6 +147,12 @@ in { pkgs, lib, ... }: {
     start_all()
     revision = json.loads(Path("${canary.bundle}/definition.json").read_text())["revisionDigest"]
     definition = json.loads(Path("${canary.bundle}/definition.json").read_text())
+    CAPTURE_REQUEST = {
+        "workloadId": "canary",
+        "revisionDigest": revision,
+        "instanceId": INSTANCE_A,
+        "generation": 1,
+    }
 
     for node in (source, target, repository):
         node.wait_for_unit("multi-user.target")
@@ -213,6 +246,52 @@ in { pkgs, lib, ... }: {
                          + "> " + PRIVATE + "/repository.json")
             node.succeed("chmod 600 " + PRIVATE + "/repository.json")
 
+    with subtest("local encrypted cache and admin backup configuration"):
+        # The cache is a second, independent encrypted repository on
+        # the source with a different runtime password; only its id
+        # and file paths enter the admin JSON, never secret values.
+        source.succeed("install -d -m 0700 " + CACHE_REPO)
+        source.succeed(
+            "head -c 32 /dev/urandom | od -An -tx1 -v"
+            + " | tr -d ' \\n' > " + PRIVATE + "/cache-password"
+            + " && chmod 600 " + PRIVATE + "/cache-password")
+        source.succeed(
+            "restic --no-cache --repo " + CACHE_REPO
+            + " --password-file " + PRIVATE + "/cache-password init")
+        cache_id = json.loads(source.succeed(
+            "restic --no-cache --repo " + CACHE_REPO
+            + " --password-file " + PRIVATE + "/cache-password"
+            + " cat config"))["id"]
+        # The module pins the exact generated worker config; it is
+        # staged verbatim into a root-owned runtime path because the
+        # store itself is not an admin-managed ancestor and the
+        # workerConfigFile safety checks are not weakened for it.
+        worker_config = source.succeed(
+            "cat /etc/nexus-worker-config-path").strip()
+        source.succeed("install -D -m 0600 " + worker_config
+                       + " /run/nexus-worker-config.json")
+        backup_config = {
+            "schemaVersion": 1,
+            "stateDir": "/var/lib/nexus-backup",
+            "workerConfigFile": "/run/nexus-worker-config.json",
+            "cache": {
+                "schemaVersion": 1, "id": "cache",
+                "repositoryIdentity": cache_id,
+                "passwordFile": PRIVATE + "/cache-password",
+                "transport": {"kind": "local", "path": CACHE_REPO},
+            },
+            "repositories": [client_config],
+            "bindings": [{
+                "workloadId": "canary",
+                "revisionDigest": revision,
+                "repositoryIds": ["repo-a"],
+            }],
+        }
+        source.succeed(
+            "printf %s " + shlex.quote(json.dumps(backup_config))
+            + " > " + BACKUP_CONFIG
+            + " && chmod 600 " + BACKUP_CONFIG)
+
     with subtest("source canary runs and records marker"):
         source.succeed(
             "mkfs.ext4 -q -U 11111111-2222-3333-4444-555555555555 /dev/vdc")
@@ -234,8 +313,14 @@ in { pkgs, lib, ... }: {
         source.succeed("curl --fail --silent -X PUT --data-binary "
                        + MARKER + " http://192.168.130.2:8080/")
 
-    with subtest("held capture barrier protects private staging copy"):
-        started_at = int(source.succeed("date +%s").strip())
+    with subtest("capture is refused without a held barrier"):
+        rc, result = backup(
+            source, backup_request("capture", **CAPTURE_REQUEST))
+        assert result["status"] == "blocked", result
+        assert result["error"] == "capture-required", result
+        assert "record" not in result, result
+
+    with subtest("held barrier enables a durable encrypted local point"):
         freeze = dict(request("ac" * 16, "freeze", INSTANCE_A, 1))
         freeze["captureId"] = CAPTURE
         rc, result = worker(source, freeze)
@@ -244,66 +329,42 @@ in { pkgs, lib, ... }: {
         source_stats = source.succeed(
             "stat -c '%u:%g:%a' /srv/workloads/" + INSTANCE_A + "/data"
             + " /srv/workloads/" + INSTANCE_A + "/data/value").split()
-        source.succeed("install -d -m 0700 " + STAGE)
-        source.succeed("install -d -m 0700 " + STAGE + "/state")
-        source.succeed("cp -a /srv/workloads/" + INSTANCE_A + "/data "
-                       + STAGE + "/state/data")
-        source.succeed("sync -f " + STAGE)
-        staged_stats = source.succeed(
-            "stat -c '%u:%g:%a' " + STAGE + "/state/data"
-            + " " + STAGE + "/state/data/value").split()
-        assert staged_stats == source_stats, (staged_stats, source_stats)
+        rc, captured = backup(
+            source, backup_request("capture", **CAPTURE_REQUEST))
+        assert captured["status"] == "completed", captured
+        record = captured["record"]
+        assert record["schemaVersion"] == 1
+        assert record["repositoryId"] == "cache"
+        assert record["repositoryIdentity"] == cache_id
+        assert len(record["snapshotId"]) == 64
+        assert record["manifest"]["capture"]["completedAt"] \
+            >= record["manifest"]["capture"]["startedAt"], record
+        # The durable local point leaves the caller's barrier held;
+        # the backup worker never thaws or starts the workload.
         rc, observed = worker(source, {
             "schemaVersion": 1, "action": "observe",
             "instanceId": INSTANCE_A})
         assert observed["captureId"] == CAPTURE, observed
         assert observed["phase"] == "stopped" \
             and observed["unitDrained"] is True, observed
-        # The capture window closes only after the copy, its fsync and
-        # the held-barrier re-query all succeeded.
-        completed_at = int(source.succeed("date +%s").strip())
-        capture_record = {
-            "adapter": "quiesce-v1", "consistency": "quiesced",
-            "startedAt": started_at, "completedAt": completed_at}
-        source_record = {
-            "hostId": "host-a", "instanceId": INSTANCE_A,
-            "generation": 1, "uidBase": 65536}
+        # The read-only bind mount lived only inside the private
+        # mount namespace the CLI wrapper unshared; nothing leaks.
+        rc, _out = source.execute(
+            "mountpoint -q /var/lib/nexus-backup/scratch/"
+            + CAPTURE + "/state")
+        assert rc != 0, "bind mount leaked into the host namespace"
+        # Source ownership and modes were never rewritten.
+        staged_stats = source.succeed(
+            "stat -c '%u:%g:%a' /srv/workloads/" + INSTANCE_A + "/data"
+            + " /srv/workloads/" + INSTANCE_A + "/data/value").split()
+        assert staged_stats == source_stats, (staged_stats, source_stats)
 
-    with subtest("adapter stores, inspects and verifies the recovery point"):
-        rc, stored = cli(source, {
-            "operation": "store", "stageDir": STAGE,
-            "definition": definition, "source": source_record,
-            "capture": capture_record, "captureId": CAPTURE})
-        assert stored["status"] == "completed", stored
-        record = stored["record"]
-        assert record["schemaVersion"] == 1
-        assert record["repositoryId"] == "repo-a"
-        assert record["repositoryIdentity"] == repo_id
-        assert len(record["snapshotId"]) == 64
-        rc, looked = cli(source, {
-            "operation": "inspect",
-            "snapshotId": record["snapshotId"]})
-        assert looked["status"] == "completed" \
-            and looked["record"] == record, looked
-        rc, checked = cli(source, {"operation": "check"})
-        assert checked["status"] == "completed", checked
-        rc, listed = cli(source, {"operation": "list_points"})
-        assert listed["status"] == "completed", listed
-        assert [item["snapshotId"] for item in listed["records"]] \
-            == [record["snapshotId"]], listed
+    with subtest("replay capture returns the identical local point"):
+        rc, replay = backup(
+            source, backup_request("capture", **CAPTURE_REQUEST))
+        assert replay == captured, (replay, captured)
 
-    with subtest("remote repository holds only encrypted opaque data"):
-        repository.succeed("test -d /srv/repos/canary/data")
-        repository.succeed("test -d /srv/repos/canary/snapshots")
-        # grep rc must be exactly 1 (no match): an I/O or usage error
-        # is not proof that plaintext is absent.
-        rc, _out = repository.execute(
-            "grep -rl " + MARKER + " /srv/repos/canary")
-        assert rc == 1, "plaintext marker leaked into repository files"
-        assert repository.succeed("hostname").strip() \
-            != source.succeed("hostname").strip()
-
-    with subtest("thaw and restart work after the immutable capture"):
+    with subtest("thaw and restart work after the durable capture"):
         thaw = dict(request("ad" * 16, "thaw", INSTANCE_A, 1))
         thaw["captureId"] = CAPTURE
         rc, result = worker(source, thaw)
@@ -313,9 +374,59 @@ in { pkgs, lib, ... }: {
         assert result["status"] == "completed", result
         source.wait_until_succeeds(
             "curl --fail --silent http://192.168.130.2:8080/", timeout=120)
+        # Live state keeps changing after the frozen point exists.
+        source.succeed("curl --fail --silent -X PUT --data-binary "
+                       + LIVE_MARKER + " http://192.168.130.2:8080/")
         guest = json.loads(source.succeed(
             "curl --fail --silent http://192.168.130.2:8080/"))
-        assert guest["value"] == MARKER, guest
+        assert guest["value"] == LIVE_MARKER, guest
+
+    with subtest("upload copies the pre-thaw point to the remote"):
+        rc, uploaded = backup(
+            source, backup_request("upload", repositoryId="repo-a"))
+        assert uploaded["status"] == "completed", uploaded
+        remote = uploaded["record"]
+        assert remote["repositoryId"] == "repo-a"
+        assert remote["repositoryIdentity"] == repo_id
+        assert remote["manifest"] == record["manifest"], remote
+        assert type(uploaded["verifiedAt"]) is int, uploaded
+        # The remote snapshot id may differ from the cache id.
+        rc, looked = cli(source, {
+            "operation": "inspect",
+            "snapshotId": remote["snapshotId"]})
+        assert looked["status"] == "completed" \
+            and looked["record"] == remote, looked
+        rc, checked = cli(source, {"operation": "check"})
+        assert checked["status"] == "completed", checked
+        rc, status = backup(source, backup_request("status"))
+        assert status["status"] == "completed", status
+        assert status["phase"] == "captured", status
+        assert status["record"] == record, status
+        assert [entry["repositoryId"] for entry in status["copies"]] \
+            == ["repo-a"], status
+
+    with subtest("replay upload verifies the existing remote copy"):
+        rc, replayed = backup(
+            source, backup_request("upload", repositoryId="repo-a"))
+        assert replayed == uploaded, (replayed, uploaded)
+        rc, listed = cli(source, {"operation": "list_points"})
+        assert listed["status"] == "completed", listed
+        assert [item["snapshotId"] for item in listed["records"]] \
+            == [remote["snapshotId"]], listed
+
+    with subtest("remote repository holds only encrypted opaque data"):
+        repository.succeed("test -d /srv/repos/canary/data")
+        repository.succeed("test -d /srv/repos/canary/snapshots")
+        # grep rc must be exactly 1 (no match): an I/O or usage error
+        # is not proof that plaintext is absent.
+        rc, _out = repository.execute(
+            "grep -rl " + MARKER + " /srv/repos/canary")
+        assert rc == 1, "plaintext marker leaked into repository files"
+        rc, _out = repository.execute(
+            "grep -rl " + LIVE_MARKER + " /srv/repos/canary")
+        assert rc == 1, "live marker reached the repository"
+        assert repository.succeed("hostname").strip() \
+            != source.succeed("hostname").strip()
 
     with subtest("source host becomes unavailable"):
         source.crash()
@@ -325,7 +436,7 @@ in { pkgs, lib, ... }: {
         assert listed["status"] == "completed", listed
         assert len(listed["records"]) == 1, listed
         point = listed["records"][0]
-        assert point["snapshotId"] == record["snapshotId"], point
+        assert point["snapshotId"] == remote["snapshotId"], point
         assert point["manifest"]["definition"]["revisionDigest"] \
             == revision, point
         target.succeed("install -d -m 0700 /root/recovery-root")
@@ -337,6 +448,8 @@ in { pkgs, lib, ... }: {
         assert restored["record"]["manifest"] == point["manifest"]
         value = target.succeed(
             "cat /root/recovery-root/point/state/data/value")
+        # The restored bytes are the frozen pre-thaw marker, never the
+        # post-thaw live marker written after the barrier released.
         assert value == MARKER, value
         restored_stats = target.succeed(
             "stat -c '%u:%g:%a' /root/recovery-root/point/state/data"
@@ -413,7 +526,7 @@ in { pkgs, lib, ... }: {
         target.succeed("install -d -m 0700 /root/recovery-root/existing")
         expect_failed(
             target, {"operation": "restore",
-                     "snapshotId": record["snapshotId"],
+                     "snapshotId": remote["snapshotId"],
                      "destination": "/root/recovery-root/existing"},
             "destination-exists")
 

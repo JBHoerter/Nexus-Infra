@@ -652,7 +652,7 @@ class ResticRepository:
     # -- store ----------------------------------------------------------
 
     def store(self, stage_dir, definition, source, capture, *,
-              capture_id, secret_bundle=None):
+              capture_id, secret_bundle=None, capture_finished=None):
         """Upload staged state plus a sealed manifest as one point.
 
         The caller supplies an already-quiesced private staging tree
@@ -661,7 +661,12 @@ class ResticRepository:
         asserts no consistency beyond the captured tree ids. A draft
         data-only snapshot is written first to derive the restic tree
         ids, then the manifest, then a final tagged snapshot that is
-        inspected and compared before the receipt is returned."""
+        inspected and compared before the receipt is returned. When
+        ``capture_finished`` is provided it is invoked once — after
+        the draft tree ids verify and before the final manifest is
+        constructed — and its returned capture dict is what the
+        sealed manifest binds; a failing callback aborts the store
+        before any final tag exists."""
         if type(capture_id) is not str \
                 or _HEX32_RE.fullmatch(capture_id) is None:
             raise RepositoryError('invalid-capture-id')
@@ -699,6 +704,12 @@ class ResticRepository:
             # The mount-root tree blob must exist and hash to the id
             # the manifest will bind as its treeDigest.
             self._tree(subtree)
+        if capture_finished is not None:
+            try:
+                capture = capture_finished()
+            except Exception:
+                raise RepositoryError(
+                    'capture-checkpoint-failed') from None
         digests = {mount_id: 'sha256:' + subtree
                    for mount_id, subtree in subtrees.items()}
         try:
@@ -758,6 +769,71 @@ class ResticRepository:
         if record['manifest'] != manifest:
             raise RepositoryError('repository-point-invalid')
         return record
+
+    # -- copy -----------------------------------------------------------
+
+    def copy_from(self, source_repository, snapshot_id):
+        """Copy one verified final point from a local source repo.
+
+        Both identities are verified first; the source must be a
+        ``local`` transport so its path and password file can be
+        passed to the target's ``copy`` argv directly. An existing
+        identical point under the same capture tag is replayed after a
+        full target check; a different manifest under that tag is a
+        conflict. The target snapshot id is never assumed to equal
+        the source id — finals are re-queried after copy."""
+        if type(source_repository) is not ResticRepository \
+                or source_repository._transport['kind'] != 'local':
+            raise RepositoryError('invalid-transport')
+        self.verify_identity()
+        source_repository.verify_identity()
+        _hex64(snapshot_id, 'snapshot-id')
+        snapshot = source_repository._snapshot(snapshot_id, _FINAL_TAG)
+        capture_tags = [tag for tag in snapshot['tags']
+                        if tag.startswith(_DRAFT_TAG + ':')]
+        if len(capture_tags) != 1 or _HEX32_RE.fullmatch(
+                capture_tags[0][len(_DRAFT_TAG) + 1:]) is None:
+            raise RepositoryError('repository-point-invalid')
+        capture_tag = capture_tags[0]
+        manifest = source_repository._inspect_final(
+            snapshot_id, capture_tag)
+        tag_filter = _FINAL_TAG + ',' + capture_tag
+        result = self._run(
+            ['snapshots', '--json', '--tag', tag_filter],
+            max_bytes=_METADATA_MAX)
+        matching = []
+        for candidate_id in self._snapshot_ids(result.stdout):
+            record = self._receipt(
+                candidate_id,
+                self._inspect_final(candidate_id, capture_tag))
+            if record['manifest'] != manifest:
+                raise RepositoryError('capture-conflict')
+            matching.append(record)
+        if matching:
+            self.check()
+            matching.sort(key=lambda record: record['snapshotId'])
+            return matching[0]
+        source = source_repository
+        self._run(
+            ['copy', '--from-repo', source._transport['path'],
+             '--from-password-file', source._config['passwordFile'],
+             snapshot_id], timeout=_BULK_TIMEOUT)
+        result = self._run(
+            ['snapshots', '--json', '--tag', tag_filter],
+            max_bytes=_METADATA_MAX)
+        records = []
+        for candidate_id in self._snapshot_ids(result.stdout):
+            record = self._receipt(
+                candidate_id,
+                self._inspect_final(candidate_id, capture_tag))
+            if record['manifest'] != manifest:
+                raise RepositoryError('repository-point-invalid')
+            records.append(record)
+        if not records:
+            raise RepositoryError('repository-point-invalid')
+        self.check()
+        records.sort(key=lambda record: record['snapshotId'])
+        return records[0]
 
     # -- restore --------------------------------------------------------
 
