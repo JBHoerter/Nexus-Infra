@@ -40,6 +40,7 @@
         workload-artifact = pkgs.testers.runNixOSTest (import ./tests/workload-artifact.nix { inherit nixpkgs; });
         workload-worker = pkgs.testers.runNixOSTest (import ./tests/workload-worker.nix { inherit nixpkgs; });
         workload-network = pkgs.testers.runNixOSTest (import ./tests/workload-network.nix { inherit nixpkgs; });
+        workload-backup = pkgs.testers.runNixOSTest (import ./tests/workload-backup.nix { inherit nixpkgs; });
         workload-distribution = pkgs.testers.runNixOSTest (import ./tests/workload-distribution.nix { inherit nixpkgs; });
       };
     packages.x86_64-linux.mailcow-integration-lab =
