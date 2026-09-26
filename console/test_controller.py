@@ -22,10 +22,11 @@ sys.path.insert(0, str(CONSOLE))
 import controller
 import statefiles
 import test_registry
+from test_worker import sealed_fixture
 import worker
 
 
-I1, I2 = '0a' * 16, '3d' * 16
+I1, I2, I3 = '0a' * 16, '3d' * 16, '7e' * 16
 OP1, OP2 = '1a' * 16, '2b' * 16
 DIGEST = test_registry.DIGEST
 SNAPSHOT = 'f0' * 32
@@ -65,11 +66,12 @@ def worker_config(root):
 
 def observation(instance=I1, host='host-a', phase='running',
                 unit='active', drained=False, retired=False,
-                ready=('web',), observed_at=1000, generation=1):
+                ready=('web',), observed_at=1000, generation=1,
+                workload_id='canary', digest=DIGEST):
     return {'schemaVersion': 2, 'hostId': host,
             'sessionId': 'aa' * 16, 'sequence': 7,
-            'instanceId': instance, 'workloadId': 'canary',
-            'revisionDigest': DIGEST, 'generation': generation,
+            'instanceId': instance, 'workloadId': workload_id,
+            'revisionDigest': digest, 'generation': generation,
             'observedAt': observed_at, 'phase': phase,
             'unitActiveState': unit, 'unitDrained': drained,
             'retired': retired,
@@ -80,12 +82,13 @@ def observation(instance=I1, host='host-a', phase='running',
 
 def workload_row(instance=I1, host='host-a', generation=1,
                  published=True, observed_state='running', obs=None,
-                 workload_id='canary'):
+                 workload_id='canary', digest=DIGEST):
     if obs is None and observed_state not in ('unknown',):
-        obs = observation(instance, host, generation=generation)
+        obs = observation(instance, host, generation=generation,
+                          workload_id=workload_id, digest=digest)
     return {'workloadId': workload_id, 'generation': generation,
             'instanceId': instance, 'hostId': host,
-            'revisionDigest': DIGEST, 'published': published,
+            'revisionDigest': digest, 'published': published,
             'observedState': observed_state, 'observation': obs}
 
 
@@ -1630,6 +1633,323 @@ class FailoverTests(ControllerFixture):
             [r['action'] for r in self.fake_worker.requests],
             ['adopt', 'observe', 'start'])
         self.assertEqual(self.transport.operations, {})
+
+
+class DependencyTests(ControllerFixture):
+    """Controller-owned dependency readiness (real readiness model).
+
+    'canary' declares dependencies; 'broker' is a dep-less workload and
+    'bridge' itself depends on 'broker' for multi-level topological
+    order. The controller verifies the whole closure against fresh
+    /v2/state evidence at plan and again before every journaled step,
+    and marks dep-having worker requests ``dependenciesResolved``."""
+
+    def _defs(self, deps=('broker',)):
+        self.broker, _ = sealed_fixture(
+            workloadId='broker',
+            services=[{'id': 'api', 'protocol': 'http', 'port': 9000,
+                       'exposure': 'private'}])
+        self.bridge, _ = sealed_fixture(
+            workloadId='bridge', dependencies=['broker'])
+        self.canary_dep, _ = sealed_fixture(dependencies=list(deps))
+        self.digests = {
+            'broker': self.broker['revisionDigest'],
+            'bridge': self.bridge['revisionDigest'],
+            'canary': self.canary_dep['revisionDigest']}
+
+    def _dep_config(self, extra_routes=()):
+        config = test_registry.make_config()
+        config['definitions'] = [self.canary_dep, self.broker,
+                                 self.bridge]
+        config['routes'] += [dict(route) for route in extra_routes]
+        return config
+
+    def make_dep(self, extra_routes=()):
+        instance = controller.Controller(
+            self.config(registry=self._dep_config(extra_routes)),
+            transport=self.transport, runner=self.runner,
+            worker_factory=lambda c: self.fake_worker,
+            clock=lambda: 1000.0, sleeper=lambda s: None)
+        self.controllers.append(instance)
+        return instance
+
+    def _dep_row(self, workload='broker', host='host-b', instance=I2,
+                 observed_state='running', ready=('api',), generation=1):
+        digest = self.digests[workload]
+        return workload_row(
+            instance, host, generation, workload_id=workload,
+            digest=digest, observed_state=observed_state,
+            obs=observation(instance, host, workload_id=workload,
+                            digest=digest, generation=generation,
+                            ready=ready))
+
+    def _canary_row(self, **kwargs):
+        kwargs.setdefault('digest', self.digests['canary'])
+        kwargs.setdefault('workload_id', 'canary')
+        obs = kwargs.pop('obs', None)
+        if obs is None and kwargs.get('observed_state', 'running') \
+                not in ('unknown',):
+            obs = observation(
+                kwargs.get('instance', I1), kwargs.get('host', 'host-a'),
+                workload_id='canary', digest=self.digests['canary'],
+                generation=kwargs.get('generation', 1))
+        return workload_row(obs=obs, **kwargs)
+
+    def _dep_drive(self):
+        """The ExecuteLocalTests._drive state machine extended with a
+        permanently-serving broker row."""
+        def state_fn():
+            if self.transport.assigned:
+                canary = workload_row(
+                    self.new_instance, 'host-a', 2, published=False,
+                    observed_state='running',
+                    obs=observation(self.new_instance, 'host-a',
+                                    generation=2,
+                                    digest=self.digests['canary']))
+            elif self.fake_worker.retired:
+                canary = workload_row(
+                    I1, 'host-a', 1, published=True,
+                    observed_state='retired',
+                    obs=observation(
+                        I1, 'host-a', phase='stopped', unit='inactive',
+                        drained=True, retired=True, ready=(),
+                        digest=self.digests['canary']))
+            else:
+                canary = self._canary_row()
+            return state_body(canary, self._dep_row())
+        self.transport.state_fn = state_fn
+
+    def _dep_plan(self, operation_id=OP1, **overrides):
+        overrides.setdefault('revisionDigest', self.digests['canary'])
+        return plan_request(operation_id=operation_id, **overrides)
+
+    def test_plan_dependencies_verified_and_journaled(self):
+        self._defs()
+        self.stage = [self._canary_row(), self._dep_row()]
+        instance = self.make_dep()
+        response = instance.execute(self._dep_plan())
+        self.assertEqual(response['status'], 'completed')
+        plan = response['operation']['plan']
+        self.assertEqual(plan['dependencies'], ['broker'])
+        self.assertEqual(plan['dependents'], [])
+        # Replay-identical on re-run.
+        self.assertEqual(instance.execute(self._dep_plan()), response)
+
+    def test_plan_dependency_not_placed(self):
+        self._defs()
+        self.stage = [self._canary_row()]
+        instance = self.make_dep()
+        self.expect_blocked(
+            instance.execute(self._dep_plan()),
+            'dependency-not-placed')
+        self.assertFalse(os.path.exists(self.job_path()))
+
+    def test_plan_dependency_stale(self):
+        self._defs()
+        self.stage = [self._canary_row(),
+                      self._dep_row(observed_state='stale')]
+        instance = self.make_dep()
+        self.expect_blocked(
+            instance.execute(self._dep_plan()), 'dependency-stale')
+
+    def test_plan_dependency_not_ready(self):
+        # The dep is placed and fresh but not running with its routed
+        # services — distinct from 'not placed' and 'stale'.
+        self._defs()
+        route = {'id': 'route-broker', 'workloadId': 'broker',
+                 'serviceId': 'api', 'hostname': 'broker.internal'}
+        self.stage = [self._canary_row(),
+                      workload_row(
+                          I2, 'host-b', 1, workload_id='broker',
+                          digest=self.digests['broker'],
+                          observed_state='prepared',
+                          obs=observation(
+                              I2, 'host-b', phase='prepared',
+                              unit='inactive', drained=True, ready=(),
+                              workload_id='broker',
+                              digest=self.digests['broker']))]
+        instance = self.make_dep(extra_routes=[route])
+        self.expect_blocked(
+            instance.execute(self._dep_plan()),
+            'dependency-not-ready')
+        # Running but the routed service missing from readyServices.
+        self.stage[1] = self._dep_row(ready=())
+        self.expect_blocked(
+            instance.execute(self._dep_plan(operation_id=OP2)),
+            'dependency-not-ready', OP2)
+        # Routed service listed: the gate opens.
+        self.stage[1] = self._dep_row(ready=('api',))
+        response = instance.execute(self._dep_plan(operation_id=OP2))
+        self.assertEqual(response['status'], 'completed')
+
+    def test_plan_dependencies_topological_order(self):
+        # canary depends on bridge and broker; bridge itself depends on
+        # broker — broker must be verified (and journaled) first.
+        self._defs(deps=('bridge', 'broker'))
+        self.stage = [self._canary_row(),
+                      self._dep_row('broker', instance=I2),
+                      self._dep_row('bridge', instance=I3)]
+        instance = self.make_dep()
+        response = instance.execute(self._dep_plan())
+        self.assertEqual(response['status'], 'completed')
+        self.assertEqual(response['operation']['plan']['dependencies'],
+                         ['broker', 'bridge'])
+        # The deepest unmet need fails first even though the direct
+        # dep 'bridge' is also listed.
+        self.stage[1] = self._dep_row('broker', instance=I2,
+                                    observed_state='stale')
+        self.expect_blocked(
+            instance.execute(self._dep_plan(operation_id=OP2)),
+            'dependency-stale', OP2)
+
+    def test_execute_reverifies_dependencies(self):
+        # A dep that dies between plan and execute resume blocks the
+        # resume: the current step defers with the failing dep and
+        # reason journaled, and recovers when the dep comes back.
+        self._defs()
+        self._dep_drive()
+        instance = self.make_dep()
+        self.assertEqual(instance.execute(
+            self._dep_plan(toHostId='host-a'))['status'], 'completed')
+        broker_row = self._dep_row()
+        stale_broker = self._dep_row(observed_state='stale')
+        rows = [stale_broker]
+
+        def flaky_state():
+            canary = self._canary_row()
+            return state_body(canary, *rows)
+        self.transport.state_fn = flaky_state
+        response = instance.execute(action_request('execute'))
+        self.assertEqual(response['status'], 'deferred')
+        entry = next(e for e in response['operation']['checkpoints']
+                     if e['step'] == 'validate')
+        self.assertEqual(entry['state'], 'deferred')
+        self.assertEqual(entry['detail'],
+                         {'awaiting': 'dependency-evidence',
+                          'dependency': 'broker',
+                          'reason': 'dependency-stale'})
+        # Dep recovers: the same execute resumes and completes.
+        self._dep_drive()
+        final = instance.execute(action_request('execute'))
+        self.assertEqual(final['status'], 'completed', msg=final)
+        validate = next(e for e in final['operation']['checkpoints']
+                        if e['step'] == 'validate')
+        self.assertEqual(validate['detail']['dependenciesVerified'], 1)
+
+    def test_full_local_move_marks_worker_requests(self):
+        # Every gated worker request for a dep-having workload carries
+        # the controller's dependenciesResolved marker; observe (a
+        # different strict field set) never does.
+        self._defs()
+        self._dep_drive()
+        instance = self.make_dep()
+        self.assertEqual(instance.execute(
+            self._dep_plan(toHostId='host-a'))['status'], 'completed')
+        response = instance.execute(action_request('execute'))
+        self.assertEqual(response['status'], 'completed', msg=response)
+        gated = [r for r in self.fake_worker.requests
+                 if r['action'] != 'observe']
+        self.assertTrue(gated)
+        for request in gated:
+            self.assertIs(request['dependenciesResolved'], True,
+                          msg=request)
+        for request in self.fake_worker.requests:
+            if request['action'] == 'observe':
+                self.assertNotIn('dependenciesResolved', request)
+
+    def test_dependents_journaled_for_dep_hub_move(self):
+        # Moving 'broker' while its dependents 'bridge' and 'canary'
+        # run journals the exposure — advisory, never a silent drop.
+        self._defs()
+        self.stage = [
+            self._dep_row('broker', host='host-b', instance=I2),
+            self._dep_row('bridge', host='host-a', instance=I3),
+            self._canary_row()]
+        instance = self.make_dep()
+        response = instance.execute(plan_request(
+            workloadId='broker', revisionDigest=self.digests['broker'],
+            fromInstanceId=I2, toHostId='host-a'))
+        self.assertEqual(response['status'], 'completed')
+        plan = response['operation']['plan']
+        self.assertEqual(plan['dependencies'], [])
+        self.assertEqual(plan['dependents'], ['bridge', 'canary'])
+
+    def test_failover_dependency_not_placed(self):
+        # The failover journal refuses to form while a declared dep
+        # has no current placement — recovery ordering is explicit.
+        self._defs()
+        self.transport.state_fn = lambda: state_body(
+            self._canary_row(observed_state='stale'),
+            FailoverTests._other_row(self))
+        instance = self.make_dep()
+        self.expect_blocked(instance.execute(failover_request()),
+                            'dependency-not-placed')
+        self.assertFalse(os.path.exists(self.job_path()))
+        self.assertFalse(any(
+            p == '/v2/placements/fence'
+            for _m, p, _r in self.transport.requests))
+
+    def test_failover_dependency_having_completes(self):
+        # A dep-having workload fails over once its dep is serving —
+        # and the remote adopt payload carries the resolved marker.
+        self._defs()
+
+        def state_fn():
+            if self.transport.assigned:
+                canary = workload_row(
+                    self.new_instance, 'host-b', 2, published=False,
+                    observed_state='running',
+                    obs=observation(self.new_instance, 'host-b',
+                                    generation=2,
+                                    digest=self.digests['canary']))
+            else:
+                canary = self._canary_row(observed_state='stale')
+            return state_body(canary, self._dep_row(),
+                              fences=self.transport.fence_rows())
+        self.transport.state_fn = state_fn
+        self.transport.receipt_fn = dispatch_receipt(slot='s9')
+        self.transport.complete_on_read = True
+        instance = self.make_dep()
+        response = instance.execute(failover_request())
+        self.assertEqual(response['status'], 'completed', msg=response)
+        plan = response['operation']['plan']
+        self.assertEqual(plan['dependencies'], ['broker'])
+        adopt = self.transport.operation_rows('adopt')[0]
+        self.assertIs(adopt['payload']['dependenciesResolved'], True)
+        start = self.transport.operation_rows('start')[0]
+        self.assertIs(start['payload']['dependenciesResolved'], True)
+
+    def test_failover_resume_reverifies_dependencies(self):
+        # Journal formed with the dep ready; the dep dies before the
+        # fence step — resume defers on dep evidence and the fence is
+        # never posted.
+        self._defs()
+        live = [self._dep_row()]
+
+        def state_fn():
+            return state_body(self._canary_row(observed_state='stale'),
+                              *live,
+                              fences=self.transport.fence_rows())
+        self.transport.state_fn = state_fn
+        self.transport.post_failures['fence'] = (
+            503, {'schemaVersion': 2, 'status': 'error',
+                  'error': 'unavailable'})
+        instance = self.make_dep()
+        self.expect_blocked(instance.execute(failover_request()),
+                            'registry-unavailable')
+        self.assertEqual(self.read_job()['phase'], 'fence')
+        del self.transport.post_failures['fence']
+        live[0] = self._dep_row(observed_state='stale')
+        response = instance.execute(failover_request())
+        self.assertEqual(response['status'], 'deferred', msg=response)
+        fence = next(e for e in response['operation']['checkpoints']
+                     if e['step'] == 'fence')
+        self.assertEqual(fence['state'], 'deferred')
+        self.assertEqual(fence['detail'],
+                         {'awaiting': 'dependency-evidence',
+                          'dependency': 'broker',
+                          'reason': 'dependency-stale'})
+        self.assertFalse(self.transport.fences)
 
 
 if __name__ == '__main__':

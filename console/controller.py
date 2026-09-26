@@ -95,6 +95,30 @@ property of the documented sequence is preserved: the registry still
 refuses ``assign`` until the fence record exists (fence strictly
 precedes assign), and ``publish`` still follows fresh readiness
 evidence on the successor.
+
+DEPENDENCY READINESS is control-plane owned. A worker sees only local
+instances and cannot evaluate cross-host dependencies, so the
+controller owns the check: ``plan`` and the failover journal resolve
+the transitive closure of the definition's ``dependencies`` in
+topological order (a dep required by another dep precedes its
+dependent) against a fresh /v2/state read, and require every dep to
+have a current placement whose fresh observation reports running and
+lists all of the dep's routed services — the same evidence rule
+``await-ready`` applies to the successor. The verified order is
+journaled in ``plan['dependencies']`` and the gate re-runs before
+every journaled step (except ``retain``, which is post-publish
+bookkeeping): a dependency lost between plan and resume — or between
+steps — defers the operation, journaling the failing dep and reason in
+the step checkpoint; it never proceeds on stale evidence. The registry
+re-verifies the direct deps atomically at ``assign``/``publish``
+(``dependency-not-placed``/``dependency-not-ready``) so a racing
+outage cannot slip between the controller's check and the commit, and
+the worker stays fail-closed: it accepts a dep-having definition only
+when the request carries the controller-emitted
+``dependenciesResolved`` marker (see ``_worker_request``). Moving a
+workload that running workloads depend on cannot be enforced away —
+there is no force channel — so the plan journals the exposed set in
+``plan['dependents']`` as operator-visible risk evidence.
 """
 
 import argparse
@@ -725,8 +749,20 @@ def _validate_job(value, operation_id):
             != sorted(step_order.index(s) for s in seen):
         raise ControllerError('journal-invalid')
     plan = value['plan']
-    if type(plan) is not dict or set(plan) != {'steps'}:
+    if type(plan) is not dict or 'steps' not in plan \
+            or not set(plan) <= {'steps', 'dependencies', 'dependents'}:
         raise ControllerError('journal-invalid')
+    for key in ('dependencies', 'dependents'):
+        dep_list = plan.get(key)
+        if dep_list is None:
+            continue
+        if type(dep_list) is not list or len(dep_list) > 64:
+            raise ControllerError('journal-invalid')
+        for dep_id in dep_list:
+            try:
+                catalog.identifier(dep_id, 'journal ' + key)
+            except catalog.CatalogError:
+                raise ControllerError('journal-invalid') from None
     steps = plan['steps']
     if type(steps) is not list or len(steps) != len(step_order):
         raise ControllerError('journal-invalid')
@@ -1134,6 +1170,24 @@ class Controller:
                    'generation': generation}
         if capture_id is not None:
             request['captureId'] = capture_id
+        definition = self._definitions.get(
+            (job['workloadId'], job['revisionDigest']))
+        if definition is not None and definition['dependencies']:
+            # WORKER CONTRACT (dependency gate): the worker sees only
+            # local instances and cannot evaluate cross-host
+            # dependency readiness — that ownership lives here. The
+            # controller verified every declared dependency against
+            # fresh /v2/state evidence before this step ran
+            # (_require_dependencies gates each journaled step), and
+            # marks worker requests with ``dependenciesResolved: true``
+            # as proof. The worker stays fail-closed: a definition
+            # with non-empty ``dependencies`` must be rejected unless
+            # the request carries this exact marker field set to the
+            # JSON boolean true. The field is an OPTIONAL member of
+            # the strict worker request field set for non-observe
+            # actions (i.e. _REQUEST_FIELDS, hence _CAPTURE_FIELDS
+            # too); dep-less workloads may omit it entirely.
+            request['dependenciesResolved'] = True
         return request
 
     def _worker_execute(self, request):
@@ -1216,8 +1270,14 @@ class Controller:
                     break
             if not live:
                 raise ControllerError('target-session-unproven')
-        return {'registryVersion': state['version'],
-                'registryEpoch': state['registryEpoch']}
+        detail = {'registryVersion': state['version'],
+                  'registryEpoch': state['registryEpoch']}
+        definition = self._definitions.get(
+            (job['workloadId'], job['revisionDigest']))
+        if definition is not None and definition['dependencies']:
+            detail['dependenciesVerified'] = len(
+                self._dependency_order(definition, state))
+        return detail
 
     def _step_freeze(self, job, entry):
         request = self._worker_request(
@@ -1483,6 +1543,131 @@ class Controller:
             raise _Deferred({'awaiting': 'readiness-evidence'})
         return {'readyServices': sorted(observation['readyServices'])}
 
+    # -- dependency readiness (control-plane owned) --------------------------
+
+    def _dep_definition(self, workload_id, state):
+        """The definition consulted for a dependency's own edges: its
+        CURRENT placed revision when one exists (that is the revision
+        actually serving), else the lowest configured digest for
+        deterministic expansion."""
+        row = self._workload_row(state, workload_id)
+        if row is not None and row['revisionDigest'] is not None:
+            found = self._definitions.get(
+                (workload_id, row['revisionDigest']))
+            if found is not None:
+                return found
+        digest = min((d for wid, d in self._definitions
+                      if wid == workload_id), default=None)
+        return self._definitions.get((workload_id, digest)) \
+            if digest is not None else None
+
+    def _dependency_order(self, definition, state):
+        """Topological closure of ``definition['dependencies']``: every
+        transitive dependency in dependency-first order — a dep
+        required by another dep in the closure precedes its dependents,
+        so the deepest unmet need is checked (and reported) first.
+        Deterministic by sorted tie-break. The catalog proves each
+        revision's graph acyclic; cross-revision edges are re-proven
+        here — an unresolvable remainder or an oversized closure is a
+        hard graph error, never a readiness deferral."""
+        edges = {}
+        pending = list(definition['dependencies'])
+        while pending:
+            dep_id = pending.pop()
+            if dep_id in edges:
+                continue
+            dep_def = self._dep_definition(dep_id, state)
+            deps = list(dep_def['dependencies']) \
+                if dep_def is not None else []
+            edges[dep_id] = deps
+            pending.extend(deps)
+        if len(edges) > 64:
+            raise ControllerError('dependency-graph-invalid')
+        waiting = dict(edges)
+        order = []
+        ready = sorted(dep_id for dep_id, deps in waiting.items()
+                       if not deps)
+        while ready:
+            dep_id = ready.pop(0)
+            if dep_id not in waiting:
+                continue
+            order.append(dep_id)
+            del waiting[dep_id]
+            for other, deps in waiting.items():
+                if dep_id in deps:
+                    deps.remove(dep_id)
+                    if not deps:
+                        ready.append(other)
+            ready.sort()
+        if waiting:
+            raise ControllerError('dependency-graph-invalid')
+        return order
+
+    def _dependency_status(self, state, dep_id):
+        """None when the dependency is serving: a current placement
+        carrying a fresh observation reporting running and listing all
+        of the dependency's routed services — the same evidence rule
+        ``_ready_detail`` applies to the successor."""
+        row = self._workload_row(state, dep_id)
+        if row is None or row['instanceId'] is None:
+            return 'dependency-not-placed'
+        observation = self._fresh_observation(row)
+        if observation is None:
+            return 'dependency-stale'
+        if row['observedState'] != 'running' \
+                or not self._routed.get(dep_id, set()) \
+                <= set(observation['readyServices']):
+            return 'dependency-not-ready'
+        return None
+
+    def _verify_dependencies(self, definition, state):
+        """Plan/journal-time gate: raises the first failing dep's
+        typed code (deepest unmet need first); returns the verified
+        topological order for journaling."""
+        order = self._dependency_order(definition, state)
+        for dep_id in order:
+            code = self._dependency_status(state, dep_id)
+            if code is not None:
+                raise ControllerError(code)
+        return order
+
+    def _require_dependencies(self, job):
+        """Execute-time gate re-run before every journaled step: a
+        dependency lost between plan and resume — or between steps —
+        defers the operation instead of proceeding on stale evidence.
+        Graph errors are hard blocks, not deferrals."""
+        definition = self._definitions.get(
+            (job['workloadId'], job['revisionDigest']))
+        if definition is None or not definition['dependencies']:
+            return
+        state = self._registry_state()
+        for dep_id in self._dependency_order(definition, state):
+            code = self._dependency_status(state, dep_id)
+            if code is not None:
+                raise _Deferred({'awaiting': 'dependency-evidence',
+                                 'dependency': dep_id, 'reason': code})
+
+    def _dependents_running(self, workload_id, state):
+        """Direct dependents currently serving — journaled move risk:
+        stopping this workload interrupts every running workload that
+        declares it as a dependency. Advisory evidence only; a dep-hub
+        move is legitimate maintenance and the request carries no force
+        channel, so the plan records the exposure instead of blocking
+        or silently dropping the risk."""
+        dependents = sorted({
+            wid for (wid, _digest), definition
+            in self._definitions.items()
+            if wid != workload_id
+            and workload_id in definition['dependencies']})
+        running = []
+        for wid in dependents:
+            row = self._workload_row(state, wid)
+            if row is not None and row['instanceId'] is not None \
+                    and row['observedState'] == 'running' \
+                    and self._fresh_observation(row) is not None:
+                running.append(wid)
+        return running
+
     # -- failover steps (M8) ------------------------------------------------
 
     def _require_failover_evidence(self, state, row, evidence, host_id):
@@ -1518,8 +1703,14 @@ class Controller:
             raise ControllerError('generation-conflict')
         self._require_failover_evidence(
             state, row, job['request']['evidence'], job['toHostId'])
-        return {'registryVersion': state['version'],
-                'registryEpoch': state['registryEpoch']}
+        detail = {'registryVersion': state['version'],
+                  'registryEpoch': state['registryEpoch']}
+        definition = self._definitions.get(
+            (job['workloadId'], job['revisionDigest']))
+        if definition is not None and definition['dependencies']:
+            detail['dependenciesVerified'] = len(
+                self._dependency_order(definition, state))
+        return detail
 
     def _step_fence(self, job, entry):
         request = job['request']
@@ -1698,6 +1889,15 @@ class Controller:
                 and request['toSlotId'] not in {
                     slot['id'] for slot in self._worker_config['slots']}:
             raise ControllerError('unknown-slot')
+        # Dependency readiness is control-plane owned: verify the full
+        # transitive closure against this fresh /v2/state read now, and
+        # journal the verified order — execute re-verifies before every
+        # journaled step. Running dependents of the moved workload are
+        # journaled as operator-visible risk evidence (see module
+        # docstring).
+        dep_order = self._verify_dependencies(definition, state)
+        dependents = self._dependents_running(
+            request['workloadId'], state)
         host_id = self._config['hostId']
         local_source = row['hostId'] == host_id
         local_target = request['toHostId'] == host_id
@@ -1729,7 +1929,9 @@ class Controller:
                'repositoryId': request['repositoryId'],
                'snapshotId': None,
                'phase': 'planned', 'checkpoints': [],
-               'plan': {'steps': steps},
+               'plan': {'steps': steps,
+                        'dependencies': dep_order,
+                        'dependents': dependents},
                'createdAt': now, 'updatedAt': now,
                'completedAt': None}
         self._save_job(job)
@@ -1782,6 +1984,12 @@ class Controller:
             raise ControllerError('unknown-slot')
         self._require_failover_evidence(
             state, row, request['evidence'], request['toHostId'])
+        # Same control-plane dependency gate as ``plan``: failover is
+        # recovery-domain, so a dead dependency orders the recovery —
+        # fail over the dep first, then this workload.
+        dep_order = self._verify_dependencies(definition, state)
+        dependents = self._dependents_running(
+            request['workloadId'], state)
         steps = [{'step': step,
                   'disposition': 'remote'
                   if step == 'adopt'
@@ -1805,7 +2013,9 @@ class Controller:
                'captureId': None, 'restoreId': None,
                'repositoryId': None, 'snapshotId': None,
                'phase': 'planned', 'checkpoints': [],
-               'plan': {'steps': steps},
+               'plan': {'steps': steps,
+                        'dependencies': dep_order,
+                        'dependents': dependents},
                'createdAt': now, 'updatedAt': now,
                'completedAt': None}
         self._save_job(job)
@@ -1836,6 +2046,13 @@ class Controller:
             entry = self._checkpoint(job, step)
             if entry['state'] != 'completed':
                 try:
+                    # Dependency gate: re-verify declared deps on fresh
+                    # registry evidence before every journaled step —
+                    # a dep lost since plan defers here rather than
+                    # proceeding. 'retain' is post-publish bookkeeping
+                    # and exempt.
+                    if step != 'retain':
+                        self._require_dependencies(job)
                     self._run_step(job, entry)
                 except _Deferred as deferred:
                     entry['state'] = 'deferred'

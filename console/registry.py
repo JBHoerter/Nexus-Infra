@@ -14,7 +14,12 @@ reports anything, for the case where a dead or partitioned host can never
 report itself (docs/replication-failover-design.md). A fence record only
 unblocks successor ``assign``; it never marks an observed-live instance
 dead — routes, publish and observed state remain governed by fresh
-observations alone, and withdraw rules are unchanged. Nothing in this
+observations alone, and withdraw rules are unchanged. A definition that
+declares dependencies additionally requires, at the atomic ``assign`` and
+``publish`` commit points, fresh ready evidence on every declared
+dependency — the same /v2/state view the controller verifies at plan time —
+so a dependency lost between the controller's check and the commit cannot
+slip through. Nothing in this
 module or anywhere in Nexus issues fence records automatically: posting one
 is an explicit act of a future authorized failover component (DRBD
 quorum-attested) or of an operator — there is no automatic failover
@@ -624,8 +629,28 @@ class Registry:
             raise RegistryError('operation-not-allowed', 409)
         if definition['secretSetRef'] is not None:
             raise RegistryError('secret-provisioning-unavailable', 409)
-        if definition['dependencies']:
-            raise RegistryError('dependency-readiness-unavailable', 409)
+
+    def _dependencies_ready(self, workload_id, revision_digest,
+                            now, mono):
+        """Dependency readiness enforced at commit points: every
+        declared direct dependency of the workload's sealed revision
+        must have a current placement carrying fresh ready evidence —
+        the same /v2/state view the controller verifies at plan time —
+        checked atomically here so a dependency lost between the
+        controller's check and this write cannot slip through."""
+        definition = self._definitions.get(
+            (workload_id, revision_digest))
+        if definition is None:
+            return
+        for dep_id in definition['dependencies']:
+            dep_placement = self._placement(dep_id)
+            if dep_placement is None:
+                raise RegistryError('dependency-not-placed', 409)
+            dep_instance = self._instance(dep_placement[1])
+            if dep_instance is None or not self._ready(
+                    self._observation_row(dep_placement[1]),
+                    dep_instance[2], dep_id, now, mono):
+                raise RegistryError('dependency-not-ready', 409)
 
     def _observation_row(self, instance_id):
         return self.db.execute(
@@ -753,6 +778,8 @@ class Registry:
                             req['workloadId'], current,
                             old[2] if old else None):
                         raise RegistryError('retirement-required', 409)
+                self._dependencies_ready(
+                    req['workloadId'], req['revisionDigest'], now, mono)
                 if self._instance(req['instanceId']) is not None:
                     raise RegistryError('instance-conflict', 409)
                 generation = current + 1
@@ -805,6 +832,8 @@ class Registry:
                     if not self._ready(observation, instance[2],
                                        req['workloadId'], now, mono):
                         raise RegistryError('readiness-required', 409)
+                    self._dependencies_ready(
+                        req['workloadId'], instance[1], now, mono)
                     self.db.execute(
                         'UPDATE placements SET published=1'
                         ' WHERE workload_id=?', (req['workloadId'],))

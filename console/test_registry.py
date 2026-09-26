@@ -94,10 +94,10 @@ def fence_request(generation=1, host='host-a', request_id='f1' * 16,
 def observation(instance=I1, host='host-a', session='s', sequence=1, at=None,
                 phase='running', unit='active', drained=False, retired=False,
                 endpoint='192.168.140.2', ready=(), digest=DIGEST,
-                generation=1):
+                generation=1, workload='canary'):
     return {'schemaVersion': 2, 'hostId': host, 'sessionId': session,
             'sequence': sequence, 'instanceId': instance,
-            'workloadId': 'canary', 'revisionDigest': digest,
+            'workloadId': workload, 'revisionDigest': digest,
             'generation': generation, 'observedAt': at, 'phase': phase,
             'unitActiveState': unit, 'unitDrained': drained,
             'retired': retired, 'endpointAddress': endpoint,
@@ -1171,3 +1171,194 @@ class FenceTests(unittest.TestCase):
                     reg.fence(bad, fence_request())
                 self.assertEqual(ctx.exception.status, 403)
             self.assertEqual(reg.state(READER)['fences'], [])
+
+
+class DependencyAssignTests(unittest.TestCase):
+    """Declared-dependency readiness enforced atomically at the
+    assign/publish commit points: a dependent cannot be placed while a
+    dep lacks a current placement with fresh ready evidence — the same
+    /v2/state view the controller verifies at plan time."""
+
+    def _dep_config(self, broker_route=False):
+        broker, _ = sealed_fixture(
+            workloadId='broker',
+            services=[{'id': 'api', 'protocol': 'http', 'port': 9000,
+                       'exposure': 'private'}])
+        dependent, _ = sealed_fixture(dependencies=['broker'])
+        routes = [dict(ROUTE)]
+        if broker_route:
+            routes.append({'id': 'route-broker', 'workloadId': 'broker',
+                           'serviceId': 'api',
+                           'hostname': 'broker.internal'})
+        return {'schemaVersion': 2,
+                'definitions': [dependent, broker],
+                'hosts': [copy.deepcopy(HOST_A), copy.deepcopy(HOST_B)],
+                'routes': routes}, dependent, broker
+
+    @staticmethod
+    def _assign(workload, digest, instance=I1, host='host-a',
+                expected=0, request_id='a1' * 16):
+        return {'schemaVersion': 2, 'requestId': request_id,
+                'workloadId': workload, 'revisionDigest': digest,
+                'hostId': host, 'instanceId': instance,
+                'expectedGeneration': expected}
+
+    def _place_broker(self, reg, fake, broker, instance=I2,
+                      host='host-a', request_id='a2' * 16):
+        reg.assign(CONTROLLER, self._assign(
+            'broker', broker['revisionDigest'], instance, host, 0,
+            request_id))
+        return reg.open_session(
+            registry.Principal('urn:' + host, 'host', host),
+            session_request(host))['sessionId']
+
+    def _observe_broker(self, reg, fake, broker, session, sequence,
+                        instance=I2, host='host-a', ready=('api',),
+                        at=None):
+        principal = registry.Principal('urn:' + host, 'host', host)
+        endpoint = {'host-a': '192.168.140.2',
+                  'host-b': '192.168.141.2'}[host]
+        reg.observe(principal, observation(
+            instance, host, session, sequence,
+            fake.now if at is None else at, 'running', 'active', False,
+            False, endpoint, list(ready),
+            digest=broker['revisionDigest'], generation=1,
+            workload='broker'))
+
+    def test_assign_requires_placed_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, dependent, _broker = self._dep_config()
+            reg, _fake = make_registry(tmp, config=config)
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.assign(CONTROLLER, self._assign(
+                    'canary', dependent['revisionDigest']))
+            self.assertEqual(ctx.exception.code,
+                             'dependency-not-placed')
+
+    def test_assign_requires_ready_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, dependent, broker = self._dep_config()
+            reg, fake = make_registry(tmp, config=config)
+            digest = dependent['revisionDigest']
+            session = self._place_broker(reg, fake, broker)
+            # Broker placed but never observed: not ready.
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.assign(CONTROLLER, self._assign('canary', digest))
+            self.assertEqual(ctx.exception.code,
+                             'dependency-not-ready')
+            # Fresh running observation on the dep opens the assign.
+            self._observe_broker(reg, fake, broker, session, 1)
+            result = reg.assign(CONTROLLER, self._assign(
+                'canary', digest))
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['generation'], 1)
+
+    def test_assign_dependency_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, dependent, broker = self._dep_config()
+            reg, fake = make_registry(tmp, config=config)
+            digest = dependent['revisionDigest']
+            session = self._place_broker(reg, fake, broker)
+            self._observe_broker(reg, fake, broker, session, 1)
+            fake.now += 31
+            fake.mono += 31
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.assign(CONTROLLER, self._assign('canary', digest))
+            self.assertEqual(ctx.exception.code,
+                             'dependency-not-ready')
+            # A fresh dep sample re-opens the assign.
+            self._observe_broker(reg, fake, broker, session, 2)
+            result = reg.assign(CONTROLLER, self._assign(
+                'canary', digest))
+            self.assertEqual(result['status'], 'completed')
+
+    def test_assign_dependency_missing_routed_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, dependent, broker = self._dep_config(
+                broker_route=True)
+            reg, fake = make_registry(tmp, config=config)
+            digest = dependent['revisionDigest']
+            session = self._place_broker(reg, fake, broker)
+            # Running but not listing the routed service 'api'.
+            self._observe_broker(reg, fake, broker, session, 1,
+                                 ready=())
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.assign(CONTROLLER, self._assign('canary', digest))
+            self.assertEqual(ctx.exception.code,
+                             'dependency-not-ready')
+            self._observe_broker(reg, fake, broker, session, 2,
+                                 ready=('api',))
+            result = reg.assign(CONTROLLER, self._assign(
+                'canary', digest))
+            self.assertEqual(result['status'], 'completed')
+
+    def test_successor_assign_rechecks_dependencies(self):
+        """A generation-2 assign re-verifies deps: the dependent can
+        retire while its dep is up, but the successor cannot land
+        while the dep is down."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config, dependent, broker = self._dep_config()
+            reg, fake = make_registry(tmp, config=config)
+            digest = dependent['revisionDigest']
+            broker_session = self._place_broker(reg, fake, broker)
+            self._observe_broker(reg, fake, broker, broker_session, 1)
+            reg.assign(CONTROLLER, self._assign('canary', digest,
+                                                I1, 'host-b'))
+            dep_session = reg.open_session(
+                P_HOST_B, session_request('host-b'))['sessionId']
+            reg.observe(P_HOST_B, observation(
+                I1, 'host-b', dep_session, 1, fake.now, 'stopped',
+                'inactive', True, True, '192.168.141.2', (),
+                digest=digest, generation=1, workload='canary'))
+            fake.now += 31
+            fake.mono += 31
+            # Incumbent retired+drained but stale now? Re-observe the
+            # retired evidence fresh while the dep is also stale.
+            reg.observe(P_HOST_B, observation(
+                I1, 'host-b', dep_session, 2, fake.now, 'stopped',
+                'inactive', True, True, '192.168.141.2', (),
+                digest=digest, generation=1, workload='canary'))
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.assign(CONTROLLER, self._assign(
+                    'canary', digest, I3, 'host-a', 1, 'a3' * 16))
+            self.assertEqual(ctx.exception.code,
+                             'dependency-not-ready')
+            self._observe_broker(reg, fake, broker, broker_session, 2)
+            result = reg.assign(CONTROLLER, self._assign(
+                'canary', digest, I3, 'host-a', 1, 'a3' * 16))
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['generation'], 2)
+
+    def test_publish_requires_dependencies_ready(self):
+        """Publish re-verifies deps too: routes must not move to a
+        workload whose dependency just died."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config, dependent, broker = self._dep_config()
+            reg, fake = make_registry(tmp, config=config)
+            digest = dependent['revisionDigest']
+            broker_session = self._place_broker(reg, fake, broker)
+            self._observe_broker(reg, fake, broker, broker_session, 1)
+            reg.assign(CONTROLLER, self._assign('canary', digest,
+                                                I1, 'host-b'))
+            dep_session = reg.open_session(
+                P_HOST_B, session_request('host-b'))['sessionId']
+            reg.observe(P_HOST_B, observation(
+                I1, 'host-b', dep_session, 1, fake.now, 'running',
+                'active', False, False, '192.168.141.2', ('web',),
+                digest=digest, generation=1, workload='canary'))
+            # Time passes: the dependent re-reports fresh but the dep
+            # does not — the dep sample is stale at publish time.
+            fake.now += 31
+            fake.mono += 31
+            reg.observe(P_HOST_B, observation(
+                I1, 'host-b', dep_session, 2, fake.now, 'running',
+                'active', False, False, '192.168.141.2', ('web',),
+                digest=digest, generation=1, workload='canary'))
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.publish(CONTROLLER, placement_request(1, 'c1' * 16))
+            self.assertEqual(ctx.exception.code,
+                             'dependency-not-ready')
+            self._observe_broker(reg, fake, broker, broker_session, 2)
+            result = reg.publish(CONTROLLER, placement_request(
+                1, 'c1' * 16))
+            self.assertEqual(result['status'], 'completed')
