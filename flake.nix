@@ -24,7 +24,10 @@
       nexus-console = import ./vm-modules/console.nix;
       workload-host = import ./host-modules/workload-host.nix;
       workload-backup = import ./host-modules/workload-backup.nix;
+      workload-restore = import ./host-modules/workload-restore.nix;
       workload-artifacts = import ./host-modules/workload-artifacts.nix;
+      workload-reporter = import ./host-modules/workload-reporter.nix;
+      workload-controller = import ./host-modules/workload-controller.nix;
       workload-registry = import ./host-modules/workload-registry.nix;
       workload-ingress = import ./host-modules/workload-ingress.nix;
       workload-base = import ./workload-modules/base.nix;
@@ -44,6 +47,7 @@
         workload-backup = pkgs.testers.runNixOSTest (import ./tests/workload-backup.nix { inherit nixpkgs; });
         workload-distribution = pkgs.testers.runNixOSTest (import ./tests/workload-distribution.nix { inherit nixpkgs; });
         workload-idmap = pkgs.testers.runNixOSTest (import ./tests/workload-idmap.nix { inherit nixpkgs; });
+        workload-restore = pkgs.testers.runNixOSTest (import ./tests/workload-restore.nix { inherit nixpkgs; });
       };
     packages.x86_64-linux.mailcow-integration-lab =
       let pkgs = import nixpkgs { system = "x86_64-linux"; };
