@@ -211,7 +211,11 @@ def validate_config(config):
            'config-maxBackoffSeconds')
     clis = {}
     for program_key, config_key in _OPTIONAL_CLIS:
-        present = (program_key in config, config_key in config)
+        # normalize() emits explicit nulls for absent pairs, so a
+        # re-validated normalized config must treat null as absent —
+        # only a non-null value counts as the pair being configured.
+        present = (config.get(program_key) is not None,
+                   config.get(config_key) is not None)
         if any(present) and not all(present):
             raise ReporterError('invalid-config')
         if all(present):
