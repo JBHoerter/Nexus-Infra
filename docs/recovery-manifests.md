@@ -76,7 +76,8 @@ the future authorized transport and evidence records.
   reconstruction and manual full-snapshot-id restores — old points are
   never upgraded in place — but they carry no `stateSetDigest` and do not
   bind state-root metadata. They need a native parent-tree comparison
-  before reuse and are not sufficient for automatic installation.
+  before reuse and are not sufficient for automatic installation; the
+  `nexus-restore` installer refuses them with `manifest-unsupported`.
 - `secretBundle` is present exactly when the definition declares a
   `secretSetRef`, and then carries only `{secretSetRef, versionDigest,
   bundleDigest}` — encrypted-bundle/version references, never key material

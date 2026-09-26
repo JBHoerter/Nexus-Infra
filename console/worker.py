@@ -47,6 +47,7 @@ _PERMIT_SECONDS = 60
 _VERIFY_BATCH = 128
 _SHOW_PROPERTIES = ('LoadState', 'ActiveState', 'SubState', 'MainPID',
                     'ControlGroup')
+_RESTORE_SENTINEL = '.nexus-restore-pending'
 
 
 def _fields(value, expected, context):
@@ -1166,6 +1167,16 @@ class Worker(SecurePaths):
             (instance_id,)).fetchone()
         return row[0] if row else None
 
+    def _restore_pending(self, rec):
+        if rec['binding'] is None:
+            return False
+        path = os.path.join(self._instance_dir(rec), _RESTORE_SENTINEL)
+        try:
+            st = self._lstat(path)
+        except OSError:
+            raise WorkerError('path-unavailable') from None
+        return st is not None
+
     def _capture_matches(self, row, rec):
         return (row['instance_id'], row['workload_id'],
                 row['revision_digest'], row['generation']) == (
@@ -1299,6 +1310,12 @@ class Worker(SecurePaths):
         if rec['retired']:
             raise WorkerError('instance-retired')
         self._require_binding_current(rec)
+        # Runs inside the execute() flock: nexus-restore claims the
+        # sentinel under this same lock atomically with its
+        # prepared-and-never-started proof, so this gate can never be
+        # bypassed by a raced stage.
+        if self._restore_pending(rec):
+            raise WorkerError('restore-incomplete')
         bundle, manifest, definition = self._resolve(
             rec['workload_id'], rec['revision_digest'])
         self._check_bundle_host(manifest, definition)
@@ -1582,6 +1599,7 @@ class Worker(SecurePaths):
             'retired': bool(rec['retired']),
             'unitDrained': self._unit_drained(show),
             'captureId': self._capture_id_of(rec['instance_id']),
+            'restorePending': self._restore_pending(rec),
             'endpointAddress': slot['localAddress'] if slot else None,
         }
 

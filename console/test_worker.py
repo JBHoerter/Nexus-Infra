@@ -959,6 +959,41 @@ class StartStopTests(unittest.TestCase):
             self.assertEqual(rec['phase'], 'prepared')
             self.assertEqual(rec['permit'], 0)
 
+    def test_start_refused_while_restore_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            instance.execute(request('prepare', revisionDigest=digest))
+            sentinel = os.path.join(tmp, 'storage', '0a' * 16,
+                                    worker._RESTORE_SENTINEL)
+            Path(sentinel).write_text('x')
+            result = instance.execute(request('start', op='bb' * 16,
+                                              revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'restore-incomplete')
+            self.assertFalse(
+                any(c[2:3] == ['start'] for c in runner.calls))
+            self.assertEqual(instance._get_instance('0a' * 16)['phase'],
+                             'prepared')
+            os.unlink(sentinel)
+            result = instance.execute(request('start', op='cc' * 16,
+                                              revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['appliedPhase'], 'running')
+
+    def test_observe_reports_restore_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, *_ , definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            instance.execute(request('prepare', revisionDigest=digest))
+            self.assertFalse(instance.execute(observe())['restorePending'])
+            sentinel = os.path.join(tmp, 'storage', '0a' * 16,
+                                    worker._RESTORE_SENTINEL)
+            Path(sentinel).write_text('x')
+            self.assertTrue(instance.execute(observe())['restorePending'])
+            os.unlink(sentinel)
+            self.assertFalse(instance.execute(observe())['restorePending'])
+
     def test_start_rechecks_closure(self):
         with tempfile.TemporaryDirectory() as tmp:
             instance, runner, fs, clock, definition, _ = make_worker(tmp)

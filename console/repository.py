@@ -710,7 +710,8 @@ class ResticRepository:
         # carries the final tag, whatever happens later.
         draft_tag = _DRAFT_TAG + ':' + capture_id
         result = self._run(
-            ['backup', '--json', '--quiet', '--host', source['hostId'],
+            ['backup', '--json', '--quiet',
+             '--host', source['hostId'],
              '--tag', draft_tag, _STATE_NAME],
             cwd=stage_dir, timeout=_BULK_TIMEOUT)
         draft_id = self._parse_summary(result.stdout)
@@ -785,7 +786,8 @@ class ResticRepository:
             return matching[0]
 
         result = self._run(
-            ['backup', '--json', '--quiet', '--host', source['hostId'],
+            ['backup', '--json', '--quiet',
+             '--host', source['hostId'],
              '--tag', _FINAL_TAG, '--tag', draft_tag,
              _STATE_NAME, _MANIFEST_NAME],
             cwd=stage_dir, timeout=_BULK_TIMEOUT)
