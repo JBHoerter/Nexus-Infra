@@ -31,7 +31,8 @@ DIGEST = test_registry.DIGEST
 SNAPSHOT = 'f0' * 32
 _PHASE_BY_ACTION = {'freeze': 'stopped', 'thaw': 'stopped',
                     'retire': 'stopped', 'stop': 'stopped',
-                    'prepare': 'prepared', 'start': 'running'}
+                    'prepare': 'prepared', 'adopt': 'prepared',
+                    'start': 'running'}
 
 
 def write_private_file(path, data, mode=0o600):
@@ -109,6 +110,15 @@ def action_request(action, operation_id=OP1):
             'operationId': operation_id}
 
 
+def failover_request(operation_id=OP1, **overrides):
+    request = {'schemaVersion': 1, 'action': 'failover',
+               'operationId': operation_id, 'workloadId': 'canary',
+               'fenceRequestId': 'f5' * 16, 'toHostId': 'host-b',
+               'toSlotId': None, 'evidence': 'quorum-attested'}
+    request.update(overrides)
+    return request
+
+
 class FakeRegistryTransport:
     """Scriptable /v2/state + placement + operation-queue double.
 
@@ -125,8 +135,13 @@ class FakeRegistryTransport:
         self.assigned = False
         self.post_failures = {}
         self.operations = {}
+        self.fences = {}
+        self.fence_receipts = {}
         self.receipt_fn = None
         self.complete_on_read = False
+
+    def fence_rows(self):
+        return [copy.deepcopy(row) for row in self.fences.values()]
 
     def completed_steps(self):
         return {row['step'] for row in self.operations.values()
@@ -192,6 +207,38 @@ class FakeRegistryTransport:
             if row['status'] == 'failed':
                 body['errorCode'] = row['errorCode']
             return 200, body
+        if method == 'POST' and path == '/v2/placements/fence':
+            failure = self.post_failures.get('fence')
+            if failure is not None:
+                return failure
+            replay = self.fence_receipts.get(payload['requestId'])
+            if replay is not None:
+                return 200, copy.deepcopy(replay)
+            key = (payload['workloadId'], payload['generation'])
+            row = self.fences.get(key)
+            if row is not None \
+                    and (row['hostId'], row['evidence']) \
+                    != (payload['hostId'], payload['evidence']):
+                return 409, {'schemaVersion': 2, 'status': 'error',
+                             'error': 'fence-conflict'}
+            if row is None:
+                self.fences[key] = {
+                    'workloadId': payload['workloadId'],
+                    'generation': payload['generation'],
+                    'hostId': payload['hostId'],
+                    'evidence': payload['evidence'],
+                    'attestedBy': 'urn:controller',
+                    'requestId': payload['requestId'],
+                    'recordedAt': 1000}
+            receipt = {'schemaVersion': 2, 'status': 'accepted',
+                       'requestId': payload['requestId'],
+                       'workloadId': payload['workloadId'],
+                       'generation': payload['generation'],
+                       'hostId': payload['hostId'],
+                       'evidence': payload['evidence']}
+            self.fence_receipts[payload['requestId']] = \
+                copy.deepcopy(receipt)
+            return 200, receipt
         if method == 'POST' and path == '/v2/placements/assign':
             failure = self.post_failures.get('assign')
             if failure is not None:
@@ -313,7 +360,7 @@ def dispatch_receipt(slot='s9'):
                       'captureId': payload['captureId']}
         elif step in ('stop', 'retire'):
             result = {'appliedPhase': 'stopped'}
-        elif step == 'prepare':
+        elif step in ('prepare', 'adopt'):
             result = {'appliedPhase': 'prepared'}
         elif step == 'start':
             result = {'appliedPhase': 'running'}
@@ -1130,6 +1177,459 @@ class JournalTests(ControllerFixture):
         self.stage[0] = workload_row(observed_state='lost')
         self.expect_blocked(instance.execute(plan_request()),
                             'evidence-stale')
+
+
+class FailoverTests(ControllerFixture):
+    """M8 operator-explicit failover to a remote target:
+    refresh -> fence -> assign -> adopt -> ready -> publish.
+
+    The incumbent 'canary' sits stale on dead host-a; a sibling
+    workload keeps host-b proven live; the successor appears on host-b
+    once the assign commits and the remote adopt/observe/start ops
+    complete."""
+
+    def _other_row(self, host='host-b'):
+        """Fresh live observation bound to ``host`` — target-session
+        evidence, exactly like the move fixture uses."""
+        return workload_row(
+            I2, host, 3, workload_id='other',
+            obs={'schemaVersion': 2, 'hostId': host,
+                 'sessionId': 'bb' * 16, 'sequence': 3,
+                 'instanceId': I2, 'workloadId': 'other',
+                 'revisionDigest': DIGEST, 'generation': 3,
+                 'observedAt': 1000, 'phase': 'running',
+                 'unitActiveState': 'active', 'unitDrained': False,
+                 'retired': False, 'endpointAddress': '192.168.141.2',
+                 'readyServices': [], 'receivedAt': 1000})
+
+    def _stale_incumbent(self):
+        return workload_row(I1, 'host-a', 1, observed_state='stale')
+
+    def _successor_row(self):
+        if self.successor_running:
+            return workload_row(
+                self.new_instance, 'host-b', 2, published=False,
+                observed_state='running',
+                obs=observation(self.new_instance, 'host-b',
+                                generation=2))
+        return workload_row(
+            self.new_instance, 'host-b', 2, published=False,
+            observed_state='prepared',
+            obs=observation(self.new_instance, 'host-b',
+                            phase='prepared', unit='inactive',
+                            drained=True, ready=(), generation=2))
+
+    def _state(self):
+        def state_fn():
+            canary = self._successor_row() if self.transport.assigned \
+                else self._stale_incumbent()
+            return state_body(canary, self._other_row(),
+                              fences=self.transport.fence_rows())
+        return state_fn
+
+    def setUp(self):
+        super().setUp()
+        self.successor_running = False
+        self.transport.state_fn = self._state()
+
+    def test_failover_remote_happy_path(self):
+        self.transport.receipt_fn = dispatch_receipt(slot='s9')
+        self.transport.complete_on_read = True
+        self.successor_running = True
+        instance = self.make_controller()
+        response = instance.execute(failover_request())
+        self.assertEqual(response['status'], 'completed', msg=response)
+        operation = response['operation']
+        self.assertEqual(operation['phase'], 'completed')
+        self.assertIsNotNone(operation['completedAt'])
+        self.assertEqual(operation['generation'], 1)
+        self.assertEqual(operation['newGeneration'], 2)
+        self.assertEqual(operation['fromHostId'], 'host-a')
+        self.assertEqual(operation['fromInstanceId'], I1)
+        self.assertEqual(operation['newInstanceId'], self.new_instance)
+        self.assertEqual(operation['toSlotId'], 's9')
+        self.assertIsNone(operation['captureId'])
+        self.assertIsNone(operation['repositoryId'])
+        self.assertIsNone(operation['snapshotId'])
+        checkpoints = operation['checkpoints']
+        self.assertEqual([e['step'] for e in checkpoints],
+                         list(controller._FAILOVER_STEP_ORDER))
+        self.assertTrue(all(e['state'] == 'completed'
+                            for e in checkpoints))
+        # Ordering proof: the fence post strictly precedes assign, and
+        # the assign strictly precedes the adopt dispatch.
+        posts = [(m, p, r) for m, p, r in self.transport.requests
+                 if m == 'POST']
+        fence_at = [p for _m, p, _r in posts].index(
+            '/v2/placements/fence')
+        assign_at = [p for _m, p, _r in posts].index(
+            '/v2/placements/assign')
+        adopt_at = [p for _m, p, _r in posts].index('/v2/operations')
+        publish_at = [p for _m, p, _r in posts].index(
+            '/v2/placements/publish')
+        self.assertLess(fence_at, assign_at)
+        self.assertLess(assign_at, adopt_at)
+        self.assertLess(adopt_at, publish_at)
+        # The fence carries the operator-supplied evidence descriptor
+        # verbatim, scoped to the incumbent placement.
+        fence_post = posts[fence_at][2]
+        self.assertEqual(fence_post, {
+            'schemaVersion': 2, 'requestId': 'f5' * 16,
+            'workloadId': 'canary', 'generation': 1,
+            'hostId': 'host-a', 'evidence': 'quorum-attested'})
+        assign_post = posts[assign_at][2]
+        self.assertEqual(assign_post['expectedGeneration'], 1)
+        self.assertEqual(assign_post['instanceId'], self.new_instance)
+        # Adopt/observe/start went to host-b at the successor
+        # generation with replay-safe derived ids.
+        adopt = self.transport.operation_rows('adopt')[0]
+        self.assertEqual((adopt['hostId'], adopt['generation']),
+                         ('host-b', 2))
+        self.assertEqual(adopt['operationId'],
+                         controller._derive(OP1, 'adopt'))
+        self.assertEqual(adopt['requestId'],
+                         controller._derive(OP1, 'post:adopt'))
+        self.assertEqual(adopt['payload']['action'], 'adopt')
+        self.assertEqual(adopt['payload']['instanceId'],
+                         self.new_instance)
+        self.assertEqual(adopt['payload']['generation'], 2)
+        for step in ('adopt', 'observe', 'start'):
+            self.assertIn(
+                (step, 'host-b', 2),
+                {(row['step'], row['hostId'], row['generation'])
+                 for row in self.transport.operations.values()})
+        # The fence checkpoint records the committed record's identity.
+        fence_cp = next(e for e in checkpoints if e['step'] == 'fence')
+        self.assertEqual(fence_cp['detail']['requestId'], 'f5' * 16)
+        self.assertEqual(fence_cp['detail']['hostId'], 'host-a')
+        adopt_cp = next(e for e in checkpoints if e['step'] == 'adopt')
+        self.assertEqual(adopt_cp['detail'],
+                         {'disposition': 'remote', 'slotId': 's9'})
+        # Replay-identical on re-run; a plain execute resumes the same
+        # journal to the identical completed view.
+        replay = instance.execute(failover_request())
+        self.assertEqual(replay, response)
+        resumed = instance.execute(action_request('execute'))
+        self.assertEqual(resumed['operation'], operation)
+        self.assertEqual(resumed['action'], 'execute')
+
+    def test_failover_validation(self):
+        instance = self.make_controller()
+        for request in (
+                {}, {'schemaVersion': 1, 'action': 'failover'},
+                failover_request(operationId='zz'),
+                failover_request(fenceRequestId='zz'),
+                failover_request(toHostId='Bad_Host'),
+                failover_request(toSlotId='Bad_Slot'),
+                failover_request(extra=1),
+                failover_request(evidence=None)):
+            response = instance.execute(request)
+            self.assertEqual(response['status'], 'blocked',
+                             msg=request)
+        self.expect_blocked(
+            instance.execute(failover_request(evidence='invented')),
+            'invalid-evidence')
+        self.assertFalse(os.path.exists(self.job_path()))
+
+    def test_failover_requires_active_placement(self):
+        self.transport.state_fn = lambda: state_body(
+            {'workloadId': 'canary', 'generation': 0,
+             'instanceId': None, 'hostId': None,
+             'revisionDigest': None, 'published': False,
+             'observedState': 'unknown', 'observation': None},
+            self._other_row())
+        instance = self.make_controller()
+        self.expect_blocked(instance.execute(failover_request()),
+                            'workload-not-placed')
+        self.assertFalse(os.path.exists(self.job_path()))
+
+    def test_failover_incumbent_is_target(self):
+        instance = self.make_controller()
+        self.expect_blocked(
+            instance.execute(failover_request(toHostId='host-a')),
+            'incumbent-is-target')
+        self.assertFalse(os.path.exists(self.job_path()))
+
+    def test_failover_unknown_target(self):
+        instance = self.make_controller()
+        self.expect_blocked(
+            instance.execute(failover_request(toHostId='ghost')),
+            'unknown-host')
+
+    def test_failover_refuses_live_incumbent(self):
+        # A freshly-reporting incumbent is not host-loss: refuse, no
+        # journal, no fence.
+        self.transport.state_fn = lambda: state_body(
+            workload_row(), self._other_row())
+        instance = self.make_controller()
+        self.expect_blocked(instance.execute(failover_request()),
+                            'incumbent-live')
+        self.assertFalse(os.path.exists(self.job_path()))
+        self.assertFalse(any(
+            p == '/v2/placements/fence'
+            for _m, p, _r in self.transport.requests))
+
+    def test_failover_operator_evidence_overrides_live_incumbent(self):
+        # 'operator' evidence is the explicit human override for a
+        # reporting-but-untrusted incumbent — journaled and posted as
+        # the fence basis.
+        def state_fn():
+            canary = self._successor_row() if self.transport.assigned \
+                else workload_row()
+            return state_body(canary, self._other_row(),
+                              fences=self.transport.fence_rows())
+        self.transport.state_fn = state_fn
+        self.transport.receipt_fn = dispatch_receipt()
+        self.transport.complete_on_read = True
+        self.successor_running = True
+        instance = self.make_controller()
+        response = instance.execute(
+            failover_request(evidence='operator'))
+        self.assertEqual(response['status'], 'completed', msg=response)
+        fence_post = next(r for m, p, r in self.transport.requests
+                          if p == '/v2/placements/fence')
+        self.assertEqual(fence_post['evidence'], 'operator')
+
+    def test_failover_requires_target_session(self):
+        # No fresh observation from host-b: fail closed before fencing.
+        self.transport.state_fn = lambda: state_body(
+            self._stale_incumbent())
+        instance = self.make_controller()
+        self.expect_blocked(instance.execute(failover_request()),
+                            'target-session-unproven')
+        self.assertFalse(any(
+            p == '/v2/placements/fence'
+            for _m, p, _r in self.transport.requests))
+
+    def test_failover_conflicting_fence_evidence(self):
+        # A fence already committed for this scope with a different
+        # evidence basis conflicts at POST time.
+        self.transport.fences[('canary', 1)] = {
+            'workloadId': 'canary', 'generation': 1,
+            'hostId': 'host-a', 'evidence': 'operator',
+            'attestedBy': 'urn:controller', 'requestId': 'e1' * 16,
+            'recordedAt': 999}
+        instance = self.make_controller()
+        self.expect_blocked(instance.execute(failover_request()),
+                            'registry-fence-conflict')
+        job = self.read_job()
+        self.assertEqual(job['phase'], 'fence')
+
+    def test_failover_fence_replay_same_record(self):
+        # An identical fence committed earlier under a different
+        # requestId is a second attestation, accepted and verified.
+        self.transport.fences[('canary', 1)] = {
+            'workloadId': 'canary', 'generation': 1,
+            'hostId': 'host-a', 'evidence': 'quorum-attested',
+            'attestedBy': 'urn:controller', 'requestId': 'e1' * 16,
+            'recordedAt': 999}
+        self.transport.receipt_fn = dispatch_receipt()
+        self.transport.complete_on_read = True
+        self.successor_running = True
+        instance = self.make_controller()
+        response = instance.execute(failover_request())
+        self.assertEqual(response['status'], 'completed', msg=response)
+
+    def test_failover_resume_through_every_boundary(self):
+        """Crash/resume replay at each phase boundary: refresh, fence,
+        assign, adopt, ready, publish — completed phases are never
+        redone and derived ids stay stable."""
+        instance = self.make_controller()
+        # Blocked at 'fence': the refresh checkpoint is durable, the
+        # failed step leaves only its phase marker.
+        self.transport.post_failures['fence'] = (
+            503, {'schemaVersion': 2, 'status': 'error',
+                  'error': 'unavailable'})
+        self.expect_blocked(instance.execute(failover_request()),
+                            'registry-unavailable')
+        job = self.read_job()
+        self.assertEqual(job['phase'], 'fence')
+        self.assertEqual([e['step'] for e in job['checkpoints']],
+                         ['refresh'])
+        # Blocked at 'assign': fence committed exactly once — a
+        # completed checkpoint is never re-posted on resume.
+        del self.transport.post_failures['fence']
+        self.transport.post_failures['assign'] = (
+            409, {'schemaVersion': 2, 'status': 'error',
+                  'error': 'generation-conflict'})
+        self.expect_blocked(instance.execute(failover_request()),
+                            'registry-generation-conflict')
+        job = self.read_job()
+        self.assertEqual(job['phase'], 'assign')
+        self.assertEqual([e['step'] for e in job['checkpoints']],
+                         ['refresh', 'fence'])
+        # The failed first fence attempt was retried with the identical
+        # caller-supplied requestId and body — replay-safe, never a
+        # re-scoped second fence.
+        fence_posts = [r for m, p, r in self.transport.requests
+                       if (m, p) == ('POST', '/v2/placements/fence')]
+        self.assertEqual(len(fence_posts), 2)
+        self.assertEqual(fence_posts[0], fence_posts[1])
+        self.assertEqual(fence_posts[0]['requestId'], 'f5' * 16)
+        # Deferred at 'adopt': the remote op sits pending.
+        del self.transport.post_failures['assign']
+        response = instance.execute(failover_request())
+        self.assertEqual(response['status'], 'deferred', msg=response)
+        adopt = next(e for e in response['operation']['checkpoints']
+                     if e['step'] == 'adopt')
+        self.assertEqual(adopt['state'], 'deferred')
+        self.assertEqual(adopt['detail']['disposition'],
+                         'remote-dispatched')
+        self.assertEqual(adopt['detail']['step'], 'adopt')
+        self.assertEqual(adopt['detail']['hostId'], 'host-b')
+        self.assertEqual(len(self.transport.operation_rows('adopt')), 1)
+        # Replay while pending: identical POST, still one row.
+        again = instance.execute(failover_request())
+        self.assertEqual(again['status'], 'deferred')
+        self.assertEqual(len(self.transport.operation_rows('adopt')), 1)
+        # Deferred at 'ready': ops all complete but the successor has
+        # not yet produced a running observation.
+        self.transport.receipt_fn = dispatch_receipt(slot='s9')
+        self.transport.complete_on_read = True
+        response = instance.execute(action_request('execute'))
+        self.assertEqual(response['status'], 'deferred', msg=response)
+        ready = next(e for e in response['operation']['checkpoints']
+                     if e['step'] == 'ready')
+        self.assertEqual(ready['state'], 'deferred')
+        self.assertEqual(ready['detail'],
+                         {'awaiting': 'readiness-evidence'})
+        # Blocked at 'publish', then the final resume completes.
+        self.successor_running = True
+        self.transport.post_failures['publish'] = (
+            409, {'schemaVersion': 2, 'status': 'error',
+                  'error': 'generation-conflict'})
+        self.expect_blocked(instance.execute(failover_request()),
+                            'registry-generation-conflict')
+        self.assertEqual(self.read_job()['phase'], 'publish')
+        del self.transport.post_failures['publish']
+        final = instance.execute(failover_request())
+        self.assertEqual(final['status'], 'completed', msg=final)
+        self.assertEqual(
+            [e['step'] for e in final['operation']['checkpoints']],
+            list(controller._FAILOVER_STEP_ORDER))
+
+    def test_failover_revived_incumbent_blocks_fence_retry(self):
+        # Refresh passed while the incumbent was stale; if the host
+        # revives before the fence lands, the re-run refuses — the
+        # controller never fences a live incumbent on replay.
+        self.transport.post_failures['fence'] = (
+            503, {'schemaVersion': 2, 'status': 'error',
+                  'error': 'unavailable'})
+        instance = self.make_controller()
+        self.expect_blocked(instance.execute(failover_request()),
+                            'registry-unavailable')
+        del self.transport.post_failures['fence']
+        self.transport.state_fn = lambda: state_body(
+            workload_row(), self._other_row(),
+            fences=self.transport.fence_rows())
+        self.expect_blocked(instance.execute(failover_request()),
+                            'incumbent-live')
+        self.assertFalse(self.transport.fences)
+
+    def test_failover_adopt_receipt_handling(self):
+        # A failed adopt receipt surfaces its typed worker error.
+        def fail_adopt(row):
+            if row['step'] == 'adopt':
+                row['status'] = 'failed'
+                row['errorCode'] = 'worker-adopt-state-absent'
+        self.transport.receipt_fn = fail_adopt
+        self.transport.complete_on_read = True
+        instance = self.make_controller()
+        self.expect_blocked(instance.execute(failover_request()),
+                            'remote-worker-adopt-state-absent')
+        self.assertEqual(self.read_job()['phase'], 'adopt')
+
+    def test_failover_adopt_receipt_invalid(self):
+        def bad_adopt(row):
+            if row['step'] == 'adopt':
+                row['status'] = 'completed'
+                row['result'] = {'appliedPhase': 'stopped'}
+        self.transport.receipt_fn = bad_adopt
+        self.transport.complete_on_read = True
+        instance = self.make_controller()
+        self.expect_blocked(instance.execute(failover_request()),
+                            'remote-receipt-invalid')
+        self.assertEqual(self.read_job()['phase'], 'adopt')
+
+    def test_failover_slot_mismatch(self):
+        self.transport.receipt_fn = dispatch_receipt(slot='s9')
+        self.transport.complete_on_read = True
+        instance = self.make_controller()
+        self.expect_blocked(
+            instance.execute(failover_request(toSlotId='s0')),
+            'slot-mismatch')
+
+    def test_failover_request_conflict(self):
+        self.transport.receipt_fn = dispatch_receipt()
+        self.transport.complete_on_read = True
+        instance = self.make_controller()
+        instance.execute(failover_request())
+        self.expect_blocked(
+            instance.execute(failover_request(
+                fenceRequestId='a0' * 16)),
+            'operation-conflict')
+        self.expect_blocked(instance.execute(plan_request()),
+                            'operation-conflict')
+
+    def test_failover_abort_before_publish(self):
+        instance = self.make_controller()
+        response = instance.execute(failover_request())
+        self.assertEqual(response['status'], 'deferred')
+        abort = instance.execute(action_request('abort'))
+        self.assertEqual(abort['status'], 'completed')
+        self.assertEqual(abort['operation']['phase'], 'aborted')
+        self.assertEqual(instance.execute(action_request('abort')),
+                         abort)
+        self.expect_blocked(instance.execute(failover_request()),
+                            'operation-aborted')
+
+    def test_failover_abort_after_publish_forbidden(self):
+        self.transport.receipt_fn = dispatch_receipt()
+        self.transport.complete_on_read = True
+        self.successor_running = True
+        instance = self.make_controller()
+        response = instance.execute(failover_request())
+        self.assertEqual(response['status'], 'completed')
+        self.expect_blocked(instance.execute(action_request('abort')),
+                            'abort-forbidden')
+        # Mid-tail: publish committed, operation still running.
+        job = self.read_job()
+        job['phase'] = 'ready'
+        job['completedAt'] = None
+        statefiles.write_json(self.job_path(), job)
+        self.expect_blocked(instance.execute(action_request('abort')),
+                            'abort-forbidden')
+
+    def test_failover_local_target(self):
+        """Failover onto the controller's own host: adopt/observe/start
+        run through the local worker, not the queue."""
+        self.successor_running = True
+
+        def state_fn():
+            if self.transport.assigned:
+                canary = workload_row(
+                    self.new_instance, 'host-a', 2, published=False,
+                    observed_state='running',
+                    obs=observation(self.new_instance, 'host-a',
+                                    generation=2))
+            else:
+                canary = workload_row(I1, 'host-b', 1,
+                                      observed_state='stale')
+            return state_body(canary, self._other_row('host-a'),
+                              fences=self.transport.fence_rows())
+
+        self.transport.state_fn = state_fn
+        instance = self.make_controller()
+        response = instance.execute(failover_request(toHostId='host-a'))
+        self.assertEqual(response['status'], 'completed', msg=response)
+        adopt = next(e for e in response['operation']['checkpoints']
+                     if e['step'] == 'adopt')
+        self.assertEqual(adopt['detail'],
+                         {'disposition': 'local', 'slotId': 's1'})
+        self.assertEqual(
+            [r['action'] for r in self.fake_worker.requests],
+            ['adopt', 'observe', 'start'])
+        self.assertEqual(self.transport.operations, {})
 
 
 if __name__ == '__main__':

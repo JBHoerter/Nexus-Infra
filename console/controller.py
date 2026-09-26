@@ -48,6 +48,53 @@ status on each ``execute`` call: pending/claimed stays ``deferred``
 advances the phase machine, ``failed`` is a typed blocked error. A dead
 host can never complete a move — claimed-but-silent operations defer
 forever; nothing is silently skipped.
+
+M8 FAILOVER: ``{schemaVersion:1, action:'failover', operationId,
+workloadId, fenceRequestId, toHostId, toSlotId, evidence}`` is the
+operator-explicit, journaled counterpart to ``plan``/``execute`` for
+host-loss recovery — the same durable operation record under the same
+flock, replay-identical on re-run, abortable until publish. Nothing in
+Nexus triggers it automatically. The caller supplies the fence
+evidence descriptor (``fenceRequestId`` + ``evidence`` — the registry's
+'quorum-attested' or 'operator' attestation basis); the controller posts
+it verbatim, scoped to the incumbent it resolved from fresh registry
+state, and invents no evidence of its own.
+
+PRECONDITION — block-level safety is NOT established here: an
+authorized caller (the DRBD quorum/fence-peer machinery, verified at VM
+level by the replication fixture) must have promoted the replica on the
+target and provisioned the replicated state directory at the target's
+``<storage.root>/<newInstanceId>`` — ``newInstanceId`` derives
+deterministically from ``operationId`` — before this action is invoked.
+The controller verifies registry-visible evidence at every phase; it
+never promotes, mounts or replicates anything itself.
+
+    refresh   fresh /v2/state: incumbent placement still current and
+              stale/unproven — a fresh healthy incumbent observation
+              refuses (``incumbent-live``) unless the caller supplied
+              'operator' evidence, the explicit human override for a
+              reporting-but-untrusted host (e.g. DRBD-partitioned but
+              still heartbeating to the registry); plus a live target
+              session, same honesty rules as ``plan``
+    fence     POST /v2/placements/fence verbatim (requestId, workloadId,
+              incumbent generation, incumbent hostId, evidence), then
+              verify the record committed in a fresh /v2/state.fences
+    assign    successor assign — the committed fence substitutes for
+              the retired+drained self-report a dead host can never post
+    adopt     remote-dispatch worker ``adopt`` + ``observe`` + ``start``
+              to the target (replay-safe derived operation/request ids)
+    ready     fresh running observation listing all routed services
+    publish   POST /v2/placements/publish — routes move only here
+
+Note the journal order places ``assign`` before ``adopt`` — swapped
+relative to the design doc's logical "adopt → assign": the pull-model
+operation queue binds a dispatched step to the CURRENT placement's
+generation and holding host, so an adopt addressed to the target is
+only deliverable once the successor assign has committed. The safety
+property of the documented sequence is preserved: the registry still
+refuses ``assign`` until the fence record exists (fence strictly
+precedes assign), and ``publish`` still follows fresh readiness
+evidence on the successor.
 """
 
 import argparse
@@ -130,6 +177,12 @@ _JOB_FIELDS = {'schemaVersion', 'request', 'configDigest',
 _STEP_ORDER = ('validate', 'freeze', 'capture', 'thaw', 'retire-source',
                'assign', 'install-target', 'await-ready', 'publish',
                'retain')
+_FAILOVER_FIELDS = {'schemaVersion', 'action', 'operationId',
+                    'workloadId', 'fenceRequestId', 'toHostId',
+                    'toSlotId', 'evidence'}
+_FAILOVER_STEP_ORDER = ('refresh', 'fence', 'assign', 'adopt', 'ready',
+                        'publish')
+_STEP_ORDERS = {'plan': _STEP_ORDER, 'failover': _FAILOVER_STEP_ORDER}
 _PHASES = ('planned', 'completed', 'aborted') + _STEP_ORDER
 _CHECKPOINT_FIELDS = {'step', 'state', 'at', 'detail'}
 _CHECKPOINT_STATES = ('started', 'deferred', 'completed')
@@ -545,6 +598,33 @@ def _validate_plan_request(request, context='request'):
         raise ControllerError('invalid-request') from None
 
 
+def _validate_failover_request(request, context='request'):
+    """Strict canonical input for the M8 failover action: the caller
+    names only the workload, the target and the fence attestation it
+    wants posted — the incumbent instance, revision and generation are
+    resolved from live registry state, never trusted from input."""
+    if type(request) is not dict or set(request) != _FAILOVER_FIELDS:
+        raise ControllerError('invalid-request')
+    if request['schemaVersion'] != 1 or request['action'] != 'failover':
+        raise ControllerError('invalid-request')
+    try:
+        worker._hex32(request['operationId'], context + ' operationId')
+        catalog.identifier(request['workloadId'],
+                           context + ' workloadId')
+        worker._hex32(request['fenceRequestId'],
+                      context + ' fenceRequestId')
+        catalog.identifier(request['toHostId'], context + ' toHostId')
+        slot = request['toSlotId']
+        if slot is not None:
+            catalog.identifier(slot, context + ' toSlotId')
+    except worker.WorkerError as error:
+        raise ControllerError(error.code) from None
+    except catalog.CatalogError:
+        raise ControllerError('invalid-request') from None
+    if request['evidence'] not in registry._FENCE_EVIDENCE:
+        raise ControllerError('invalid-evidence')
+
+
 def _validate_action_request(request):
     if type(request) is not dict or set(request) != _ACTION_FIELDS:
         raise ControllerError('invalid-request')
@@ -557,10 +637,10 @@ def _validate_action_request(request):
         raise ControllerError(error.code) from None
 
 
-def _validate_checkpoint(value):
+def _validate_checkpoint(value, step_order=_STEP_ORDER):
     if type(value) is not dict or set(value) != _CHECKPOINT_FIELDS:
         raise ControllerError('journal-invalid')
-    if value['step'] not in _STEP_ORDER \
+    if value['step'] not in step_order \
             or value['state'] not in _CHECKPOINT_STATES:
         raise ControllerError('journal-invalid')
     if type(value['at']) is not int or not 0 <= value['at'] <= 2**53:
@@ -574,8 +654,16 @@ def _validate_job(value, operation_id):
     if type(value['schemaVersion']) is not int \
             or value['schemaVersion'] != 1:
         raise ControllerError('journal-invalid')
-    _validate_plan_request(value['request'], 'journal')
-    if value['request']['operationId'] != operation_id \
+    request = value['request']
+    failover = type(request) is dict \
+        and request.get('action') == 'failover'
+    if failover:
+        _validate_failover_request(request, 'journal')
+        step_order = _FAILOVER_STEP_ORDER
+    else:
+        _validate_plan_request(request, 'journal')
+        step_order = _STEP_ORDER
+    if request['operationId'] != operation_id \
             or value['operationId'] != operation_id:
         raise ControllerError('journal-invalid')
     if type(value['configDigest']) is not str \
@@ -589,20 +677,26 @@ def _validate_job(value, operation_id):
         catalog.identifier(value['fromHostId'], 'journal fromHostId')
         catalog.identifier(value['toHostId'], 'journal toHostId')
         worker._hex32(value['newInstanceId'], 'journal newInstanceId')
-        worker._hex32(value['captureId'], 'journal captureId')
-        worker._hex32(value['restoreId'], 'journal restoreId')
-        catalog.identifier(value['repositoryId'],
-                           'journal repositoryId')
         worker._integer(value['generation'], 1, worker._MAX_I64,
                         'journal generation')
         worker._integer(value['newGeneration'], 2, worker._MAX_I64,
                         'journal newGeneration')
         worker._integer(value['createdAt'], 0, 2**53, 'journal')
         worker._integer(value['updatedAt'], 0, 2**53, 'journal')
+        if not failover:
+            worker._hex32(value['captureId'], 'journal captureId')
+            worker._hex32(value['restoreId'], 'journal restoreId')
+            catalog.identifier(value['repositoryId'],
+                               'journal repositoryId')
     except worker.WorkerError:
         raise ControllerError('journal-invalid') from None
     except catalog.CatalogError:
         raise ControllerError('journal-invalid') from None
+    if failover and (value['captureId'] is not None
+                     or value['restoreId'] is not None
+                     or value['repositoryId'] is not None
+                     or value['snapshotId'] is not None):
+        raise ControllerError('journal-invalid')
     if value['newGeneration'] != value['generation'] + 1:
         raise ControllerError('journal-invalid')
     if value['toSlotId'] is not None:
@@ -614,31 +708,32 @@ def _validate_job(value, operation_id):
             and (type(value['snapshotId']) is not str
                  or _HEX64_RE.fullmatch(value['snapshotId']) is None):
         raise ControllerError('journal-invalid')
-    if value['phase'] not in _PHASES:
+    phases = ('planned', 'completed', 'aborted') + step_order
+    if value['phase'] not in phases:
         raise ControllerError('journal-invalid')
     checkpoints = value['checkpoints']
     if type(checkpoints) is not list \
-            or len(checkpoints) > len(_STEP_ORDER):
+            or len(checkpoints) > len(step_order):
         raise ControllerError('journal-invalid')
     seen = []
     for entry in checkpoints:
-        _validate_checkpoint(entry)
+        _validate_checkpoint(entry, step_order)
         if entry['step'] in seen:
             raise ControllerError('journal-invalid')
         seen.append(entry['step'])
-    if [ _STEP_ORDER.index(s) for s in seen ] \
-            != sorted(_STEP_ORDER.index(s) for s in seen):
+    if [step_order.index(s) for s in seen] \
+            != sorted(step_order.index(s) for s in seen):
         raise ControllerError('journal-invalid')
     plan = value['plan']
     if type(plan) is not dict or set(plan) != {'steps'}:
         raise ControllerError('journal-invalid')
     steps = plan['steps']
-    if type(steps) is not list or len(steps) != len(_STEP_ORDER):
+    if type(steps) is not list or len(steps) != len(step_order):
         raise ControllerError('journal-invalid')
     for index, item in enumerate(steps):
         if type(item) is not dict \
                 or set(item) != {'step', 'disposition'} \
-                or item['step'] != _STEP_ORDER[index] \
+                or item['step'] != step_order[index] \
                 or item['disposition'] not in ('local', 'remote'):
             raise ControllerError('journal-invalid')
     completed = value['completedAt']
@@ -1372,6 +1467,12 @@ class Controller:
         return {'disposition': 'local', 'slotId': slot_id}
 
     def _step_await_ready(self, job, entry):
+        return self._ready_detail(job)
+
+    def _ready_detail(self, job):
+        """Shared await-ready body (move 'await-ready' and failover
+        'ready'): a fresh running observation of the successor listing
+        every routed service, else deferred."""
         found = self._ready_evidence(job)
         if found is None:
             raise _Deferred({'awaiting': 'readiness-evidence'})
@@ -1381,6 +1482,141 @@ class Controller:
                 <= set(observation['readyServices']):
             raise _Deferred({'awaiting': 'readiness-evidence'})
         return {'readyServices': sorted(observation['readyServices'])}
+
+    # -- failover steps (M8) ------------------------------------------------
+
+    def _require_failover_evidence(self, state, row, evidence, host_id):
+        """Failover precondition on fresh registry evidence — the same
+        staleness honesty rules ``plan`` applies: a fresh, healthy
+        incumbent observation means the host is NOT lost and this
+        controller refuses to fence it (``incumbent-live``), unless the
+        caller supplied 'operator' evidence — the explicit human
+        override for a reporting-but-untrusted incumbent (e.g.
+        DRBD-partitioned yet still heartbeating). The target must
+        always show a fresh current-session observation: a failover to
+        an unproven host can never finish, so it fails closed before
+        the durable fence is posted."""
+        if self._fresh_observation(row) is not None \
+                and evidence != 'operator':
+            raise ControllerError('incumbent-live')
+        for other in state['workloads']:
+            if other['hostId'] == host_id \
+                    and self._fresh_observation(other) is not None:
+                return
+        raise ControllerError('target-session-unproven')
+
+    def _step_refresh(self, job, entry):
+        state = self._registry_state()
+        row = self._workload_row(state, job['workloadId'])
+        if row is None or row['instanceId'] is None:
+            raise ControllerError('workload-not-placed')
+        if row['instanceId'] != job['fromInstanceId'] \
+                or row['hostId'] != job['fromHostId'] \
+                or row['revisionDigest'] != job['revisionDigest']:
+            raise ControllerError('instance-mismatch')
+        if row['generation'] != job['generation']:
+            raise ControllerError('generation-conflict')
+        self._require_failover_evidence(
+            state, row, job['request']['evidence'], job['toHostId'])
+        return {'registryVersion': state['version'],
+                'registryEpoch': state['registryEpoch']}
+
+    def _step_fence(self, job, entry):
+        request = job['request']
+        payload = {'schemaVersion': 2,
+                   'requestId': request['fenceRequestId'],
+                   'workloadId': job['workloadId'],
+                   'generation': job['generation'],
+                   'hostId': job['fromHostId'],
+                   'evidence': request['evidence']}
+        # Re-verify incumbent identity and staleness against a fresh
+        # state read immediately before the durable fence post — the
+        # refresh checkpoint may have completed in an earlier execute
+        # call, and a revived incumbent must never be fenced by replay.
+        state = self._registry_state()
+        row = self._workload_row(state, job['workloadId'])
+        if row is None or row['instanceId'] != job['fromInstanceId'] \
+                or row['hostId'] != job['fromHostId'] \
+                or row['generation'] != job['generation']:
+            raise ControllerError('instance-mismatch')
+        if self._fresh_observation(row) is not None \
+                and request['evidence'] != 'operator':
+            raise ControllerError('incumbent-live')
+        status, body = self._transport.request(
+            'POST', '/v2/placements/fence', payload)
+        if status != 200 or type(body) is not dict \
+                or body.get('status') != 'accepted' \
+                or body.get('requestId') != payload['requestId'] \
+                or body.get('workloadId') != payload['workloadId'] \
+                or body.get('generation') != payload['generation'] \
+                or body.get('hostId') != payload['hostId'] \
+                or body.get('evidence') != payload['evidence']:
+            raise ControllerError(self._registry_code(status, body))
+        # Verify committed: a fresh /v2/state read must show the fence
+        # covering exactly this incumbent before the successor assign
+        # may rely on it.
+        for fence in self._registry_state()['fences']:
+            if fence['workloadId'] == job['workloadId'] \
+                    and fence['generation'] == job['generation']:
+                if fence['hostId'] != job['fromHostId'] \
+                        or fence['evidence'] != request['evidence']:
+                    raise ControllerError('registry-response-invalid')
+                return {'requestId': fence['requestId'],
+                        'hostId': fence['hostId'],
+                        'evidence': fence['evidence'],
+                        'attestedBy': fence['attestedBy']}
+        raise ControllerError('registry-response-invalid')
+
+    def _step_adopt(self, job, entry):
+        """Claim the pre-staged replica dir on the target and start the
+        successor — the failover analogue of install-target. Remote
+        targets go through the operation queue (only deliverable after
+        the assign committed: the queue binds to the current holder);
+        a local target uses the co-located worker."""
+        adopt = self._worker_request(
+            job, 'adopt', 'adopt', job['newInstanceId'],
+            job['newGeneration'])
+        start = self._worker_request(
+            job, 'start', 'start', job['newInstanceId'],
+            job['newGeneration'])
+        if job['toHostId'] != self._config['hostId']:
+            view = self._remote_step(
+                job, 'adopt', job['toHostId'], 'adopt',
+                job['newGeneration'], adopt)
+            if view['result'].get('appliedPhase') != 'prepared':
+                raise ControllerError('remote-receipt-invalid')
+            observe = {'schemaVersion': 1, 'action': 'observe',
+                       'instanceId': job['newInstanceId']}
+            view = self._remote_step(
+                job, 'observe', job['toHostId'], 'observe',
+                job['newGeneration'], observe)
+            observed = view['result']
+            if observed.get('bindingCurrent') is not True:
+                raise ControllerError('remote-receipt-invalid')
+            slot_id = observed.get('slotId')
+            if type(slot_id) is not str:
+                raise ControllerError('remote-receipt-invalid')
+            if job['toSlotId'] is not None \
+                    and slot_id != job['toSlotId']:
+                raise ControllerError('slot-mismatch')
+            job['toSlotId'] = slot_id
+            view = self._remote_step(
+                job, 'start', job['toHostId'], 'start',
+                job['newGeneration'], start)
+            if view['result'].get('appliedPhase') != 'running':
+                raise ControllerError('remote-receipt-invalid')
+            return {'disposition': 'remote', 'slotId': slot_id}
+        receipt = self._worker_execute(adopt)
+        if receipt.get('appliedPhase') != 'prepared':
+            raise ControllerError('worker-receipt-invalid')
+        slot_id = self._target_slot(job)
+        receipt = self._worker_execute(start)
+        if receipt.get('appliedPhase') != 'running':
+            raise ControllerError('worker-receipt-invalid')
+        return {'disposition': 'local', 'slotId': slot_id}
+
+    def _step_ready(self, job, entry):
+        return self._ready_detail(job)
 
     def _step_publish(self, job, entry):
         receipt = self._registry_post(
@@ -1507,17 +1743,95 @@ class Controller:
         if job is None:
             raise ControllerError('operation-missing')
         self._check_job_config(job)
+        return self._run_phases(request, job)
+
+    def _failover(self, request):
+        """Operator-explicit failover verb: create the journal on first
+        sight of this operationId (validating against live registry
+        state), then run the phase machine; an identical re-run resumes
+        the same journal replay-identically."""
+        self._acquire_lock()
+        job = self._load_job(request['operationId'])
+        if job is None:
+            job = self._new_failover_job(request)
+        elif job['request'] != request:
+            raise ControllerError('operation-conflict')
+        self._check_job_config(job)
+        return self._run_phases(request, job)
+
+    def _new_failover_job(self, request):
+        state = self._registry_state()
+        row = self._workload_row(state, request['workloadId'])
+        if row is None or row['instanceId'] is None:
+            raise ControllerError('workload-not-placed')
+        if row['hostId'] == request['toHostId']:
+            raise ControllerError('incumbent-is-target')
+        definition = self._definitions.get(
+            (request['workloadId'], row['revisionDigest']))
+        if definition is None:
+            raise ControllerError('unknown-workload')
+        target = self._hosts.get(request['toHostId'])
+        if target is None:
+            raise ControllerError('unknown-host')
+        if target['architecture'] != definition['architecture']:
+            raise ControllerError('architecture-mismatch')
+        if request['toSlotId'] is not None \
+                and request['toHostId'] == self._config['hostId'] \
+                and request['toSlotId'] not in {
+                    slot['id'] for slot in self._worker_config['slots']}:
+            raise ControllerError('unknown-slot')
+        self._require_failover_evidence(
+            state, row, request['evidence'], request['toHostId'])
+        steps = [{'step': step,
+                  'disposition': 'remote'
+                  if step == 'adopt'
+                  and request['toHostId'] != self._config['hostId']
+                  else 'local'}
+                 for step in _FAILOVER_STEP_ORDER]
+        now = self._now()
+        job = {'schemaVersion': 1, 'request': dict(request),
+               'configDigest': self._config_digest,
+               'operationId': request['operationId'],
+               'workloadId': request['workloadId'],
+               'revisionDigest': row['revisionDigest'],
+               'fromInstanceId': row['instanceId'],
+               'fromHostId': row['hostId'],
+               'toHostId': request['toHostId'],
+               'toSlotId': request['toSlotId'],
+               'newInstanceId': _derive(request['operationId'],
+                                        'instance'),
+               'generation': row['generation'],
+               'newGeneration': row['generation'] + 1,
+               'captureId': None, 'restoreId': None,
+               'repositoryId': None, 'snapshotId': None,
+               'phase': 'planned', 'checkpoints': [],
+               'plan': {'steps': steps},
+               'createdAt': now, 'updatedAt': now,
+               'completedAt': None}
+        self._save_job(job)
+        return job
+
+    @staticmethod
+    def _step_order(job):
+        return _STEP_ORDERS[job['request']['action']]
+
+    def _run_phases(self, request, job):
+        """The shared journaled phase machine for move and failover
+        records: completed checkpoints skip, deferred stays deferred
+        with its instruction, and every transition is persisted BEFORE
+        the action it describes so a crash replays identical ids."""
         if job['phase'] == 'aborted':
             raise ControllerError('operation-aborted')
         if job['phase'] == 'completed':
             return {'schemaVersion': 1, 'status': 'completed',
-                    'action': 'execute',
+                    'action': request['action'],
                     'operationId': request['operationId'],
                     'operation': self._operation_view(job)}
+        steps = self._step_order(job)
         if job['phase'] == 'planned':
-            job['phase'] = _STEP_ORDER[0]
+            job['phase'] = steps[0]
             self._save_job(job)
-        while job['phase'] in _STEP_ORDER:
+        while job['phase'] in steps:
             step = job['phase']
             entry = self._checkpoint(job, step)
             if entry['state'] != 'completed':
@@ -1528,11 +1842,11 @@ class Controller:
                     entry['detail'] = deferred.detail
                     self._save_job(job)
                     return {'schemaVersion': 1, 'status': 'deferred',
-                            'action': 'execute',
+                            'action': request['action'],
                             'operationId': request['operationId'],
                             'operation': self._operation_view(job)}
                 self._save_job(job)
-            next_phase = self._advance(step)
+            next_phase = self._advance(step, steps)
             if next_phase == 'completed':
                 # Do not persist a bare 'completed' phase; the final
                 # block below writes it together with completedAt.
@@ -1543,16 +1857,16 @@ class Controller:
         job['completedAt'] = self._now()
         self._save_job(job)
         return {'schemaVersion': 1, 'status': 'completed',
-                'action': 'execute',
+                'action': request['action'],
                 'operationId': request['operationId'],
                 'operation': self._operation_view(job)}
 
     @staticmethod
-    def _advance(step):
-        index = _STEP_ORDER.index(step)
-        if index + 1 >= len(_STEP_ORDER):
+    def _advance(step, order):
+        index = order.index(step)
+        if index + 1 >= len(order):
             return 'completed'
-        return _STEP_ORDER[index + 1]
+        return order[index + 1]
 
     def _status(self, request):
         self._acquire_lock()
@@ -1613,6 +1927,9 @@ class Controller:
             if action == 'plan':
                 _validate_plan_request(request)
                 return self._plan(request)
+            if action == 'failover':
+                _validate_failover_request(request)
+                return self._failover(request)
             if action == 'execute':
                 _validate_action_request(request)
                 return self._execute(request)
