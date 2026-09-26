@@ -49,6 +49,7 @@
         workload-distribution = pkgs.testers.runNixOSTest (import ./tests/workload-distribution.nix { inherit nixpkgs; });
         workload-idmap = pkgs.testers.runNixOSTest (import ./tests/workload-idmap.nix { inherit nixpkgs; });
         workload-move = pkgs.testers.runNixOSTest (import ./tests/workload-move.nix { inherit nixpkgs; });
+        workload-drbd = pkgs.testers.runNixOSTest (import ./tests/workload-drbd.nix { inherit nixpkgs; });
         workload-restore = pkgs.testers.runNixOSTest (import ./tests/workload-restore.nix { inherit nixpkgs; });
         workload-secrets = pkgs.testers.runNixOSTest (import ./tests/workload-secrets.nix { inherit nixpkgs; });
       };
