@@ -127,30 +127,15 @@ let
       hostId = "host-b"; }
   ];
 
-  # The reporter module ships the daemon and its hardening, but its
-  # pinned ExecStart bakes a config that cannot carry the optional
-  # backupProgram/restoreProgram dispatch pairs; this fixture stages a
-  # richer config at /run and points the same hardened unit at it.
-  # pkgs.nix rides in the wrapper PATH because the embedded worker
-  # shells out to nix/nix-store for closure verification on
-  # dispatched prepare/start steps.
-  reporterLib = pkgs: pkgs.runCommand "nexus-reporter-lib" { } ''
-    mkdir $out
-    for name in reporter registry statefiles worker artifacts catalog; do
-      cp ${../console}/$name.py $out/$name.py
-    done
-  '';
-  reporterCli = pkgs: pkgs.writeShellApplication {
-    name = "nexus-reporter";
-    runtimeInputs = [
-      pkgs.python3 pkgs.systemd pkgs.util-linux pkgs.iproute2
-      pkgs.coreutils pkgs.nix
-    ];
-    text = ''
-      exec ${pkgs.python3}/bin/python3 ${reporterLib pkgs}/reporter.py \
-        --config /run/nexus-reporter-config.json
-    '';
-  };
+  # Resolve one of the shipped CLI wrappers out of a node's own system
+  # closure — the same store path `readlink -f
+  # /run/current-system/sw/bin/<name>` yields on the guest at runtime.
+  swProgram = config: name:
+    let
+      pkg = nixpkgs.lib.findFirst (p: (p.name or "") == name)
+        (throw "workload-move: ${name} is not on the node's PATH")
+        config.environment.systemPackages;
+    in "${pkg}/bin/${name}";
 
   workerNode = { hostId, uuid, slots, extraWorker ? { } }:
     { pkgs, lib, config, ... }: {
@@ -170,8 +155,8 @@ let
     # indirection instead of discovering files in the store.
     environment.etc."nexus-worker-config-path".text =
       "${config.services.nexus-workload-worker.configFile}\n";
-    # The exact registry attrset the staged reporter/controller
-    # configs must mirror; delivered read-only via /etc.
+    # The exact registry attrset the staged controller config and the
+    # registry sanity probe must mirror; delivered read-only via /etc.
     environment.etc."nexus-registry-config.json".text =
       builtins.toJSON registryConfig;
     services.nexus-workload-reporter = {
@@ -187,6 +172,13 @@ let
       caFile = "/run/lab-pki/ca.crt";
       certificateFile = "/run/lab-pki/${hostId}.crt";
       keyFile = "/run/lab-pki/${hostId}.key";
+      # Dispatched capture/upload and stage/commit steps run the same
+      # shipped nexus-backup/nexus-restore wrappers an operator would
+      # invoke, pointed at the runtime-staged /run configs.
+      backupProgram = swProgram config "nexus-backup";
+      backupConfigFile = "/run/nexus-backup-config.json";
+      restoreProgram = swProgram config "nexus-restore";
+      restoreConfigFile = "/run/nexus-restore-config.json";
     };
     services.nexus-workload-backup = {
       enable = true;
@@ -197,13 +189,10 @@ let
       configurationFile = "/run/nexus-restore-config.json";
     };
     services.nexus-workload-worker = extraWorker;
-    # Certs and the staged config appear at runtime; keep the unit
-    # dormant until the testScript starts it.
-    systemd.services.nexus-workload-reporter = {
-      wantedBy = lib.mkForce [ ];
-      serviceConfig.ExecStart =
-        lib.mkForce "${reporterCli pkgs}/bin/nexus-reporter";
-    };
+    # Certs appear at runtime; keep the shipped unit dormant until
+    # the testScript starts it.
+    systemd.services.nexus-workload-reporter.wantedBy =
+      lib.mkForce [ ];
   };
 in { pkgs, lib, ... }: {
   name = "nexus-workload-move";
@@ -336,7 +325,6 @@ in { pkgs, lib, ... }: {
     WORKER_CONFIG = "/run/nexus-worker-config.json"
     BACKUP_CONFIG = "/run/nexus-backup-config.json"
     RESTORE_CONFIG = "/run/nexus-restore-config.json"
-    REPORTER_CONFIG = "/run/nexus-reporter-config.json"
     CONTROLLER_CONFIG = "/run/nexus-controller-config.json"
     STEP_ORDER = ["validate", "freeze", "capture", "thaw",
                   "retire-source", "assign", "install-target",
@@ -725,34 +713,12 @@ in { pkgs, lib, ... }: {
         status, body = api(
             source, "host-a", "POST", "/v2/observations", probe)
         assert status == 200 and body["status"] == "accepted", body
-        for node, host in ((source, "host-a"), (target, "host-b")):
-            backup_program = node.succeed(
-                "readlink -f /run/current-system/sw/bin/nexus-backup"
-                ).strip()
-            restore_program = node.succeed(
-                "readlink -f /run/current-system/sw/bin/nexus-restore"
-                ).strip()
-            reporter_config = {
-                "schemaVersion": 2, "hostId": host,
-                "registryUrl": REGISTRY, "registry": registry_cfg,
-                "stateDir": "/var/lib/nexus-reporter",
-                "workerConfigFile": WORKER_CONFIG,
-                "observeIntervalSeconds": 1,
-                "requestTimeoutSeconds": 10,
-                "maxBackoffSeconds": 15,
-                # The source reporter runs backup capture/upload;
-                # the target reporter runs restore stage/commit. The
-                # unused pair still needs a well-formed path, never a
-                # stubbed one.
-                "backupProgram": backup_program,
-                "backupConfigFile": BACKUP_CONFIG,
-                "restoreProgram": restore_program,
-                "restoreConfigFile": RESTORE_CONFIG,
-            }
-            node.succeed(
-                "printf %s " + shlex.quote(json.dumps(reporter_config))
-                + " > " + REPORTER_CONFIG
-                + " && chmod 600 " + REPORTER_CONFIG)
+        # The reporters run the shipped unit as installed: the module
+        # baked the backup/restore program+config pairs into its own
+        # pinned config, so nothing is staged per-host here — the
+        # units were only held dormant until the host certificates
+        # existed.
+        for node in (source, target):
             node.succeed("systemctl start nexus-workload-reporter")
         deadline = time.time() + 180
         while True:
