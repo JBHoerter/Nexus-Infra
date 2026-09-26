@@ -13,6 +13,7 @@ import urllib.request
 
 import catalog
 import console_api
+import controller
 from test_catalog import archive_definition, sealed
 from test_policy import base_policy
 from test_recovery import capture, manifest
@@ -162,10 +163,31 @@ class FakeReader:
             path, {'available': False, 'error': 'unavailable'})
 
 
-def state_response(workloads):
+def state_response(workloads, fences=()):
     return {'available': True, 'data': {
         'schemaVersion': 2, 'registryEpoch': 'e' * 32, 'version': 7,
-        'workloads': workloads}}
+        'workloads': workloads, 'fences': list(fences)}}
+
+
+def fence(workload_id='demo', generation=1, host_id='host-a',
+          **overrides):
+    record = {'workloadId': workload_id, 'generation': generation,
+              'hostId': host_id, 'evidence': 'operator',
+              'attestedBy': 'operator@console', 'requestId': 'aa' * 16,
+              'recordedAt': NOW - 20}
+    record.update(overrides)
+    return record
+
+
+def placed_on(host_id, workload_id='neighbor', instance_id='cd' * 16):
+    """A second workload placed on another host with a fresh
+    observation — proves the target host's session is live."""
+    item = placed(workloadId=workload_id, hostId=host_id,
+                  instanceId=instance_id)
+    item['observation'] = dict(item['observation'], hostId=host_id,
+                               instanceId=instance_id,
+                               workloadId=workload_id)
+    return item
 
 
 def placed(observed_state='running', observed_at=NOW - 4, **overrides):
@@ -387,7 +409,8 @@ class RegistryReaderTests(unittest.TestCase):
 
 
 class ViewTests(unittest.TestCase):
-    def _snapshot(self, directory, workloads=None, **config_overrides):
+    def _snapshot(self, directory, workloads=None, fences=(),
+                  **config_overrides):
         work = tempfile.mkdtemp(dir=directory)
         point = manifest(capture=capture(startedAt=NOW - 100,
                                          completedAt=NOW - 95))
@@ -421,7 +444,8 @@ class ViewTests(unittest.TestCase):
         config = base_config(work, **overrides)
         reader = FakeReader({
             '/v2/state': state_response(
-                [placed()] if workloads is None else workloads),
+                [placed()] if workloads is None else workloads,
+                fences),
             '/v2/assignments': {'available': False, 'error': 'denied'},
             '/v2/routes': {'available': False, 'error': 'denied'}})
         return console_api.collect(config, reader=reader, now=NOW), point
@@ -574,6 +598,150 @@ class ViewTests(unittest.TestCase):
                           codes)
             self.assertTrue(result['eligible'])
 
+    def test_plan_request_renders_runnable_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, _ = self._snapshot(
+                directory,
+                workloads=[placed(observed_state='retired'),
+                           placed_on('host-b')])
+            model = console_api.plan_request(snapshot, 'demo', 'host-b')
+            self.assertTrue(model['viable'])
+            self.assertEqual(model['reasons'], [])
+            self.assertEqual(model['sourceHostId'], 'host-a')
+            self.assertEqual(model['targetHostId'], 'host-b')
+            request = model['input']
+            self.assertEqual(
+                set(request), {'schemaVersion', 'action',
+                               'operationId', 'workloadId',
+                               'revisionDigest', 'fromInstanceId',
+                               'toHostId', 'toSlotId', 'repositoryId'})
+            self.assertEqual(request['action'], 'plan')
+            self.assertEqual(request['workloadId'], 'demo')
+            self.assertEqual(request['toHostId'], 'host-b')
+            self.assertEqual(request['fromInstanceId'], INSTANCE)
+            self.assertEqual(request['revisionDigest'],
+                             sealed()['revisionDigest'])
+            self.assertEqual(request['repositoryId'], 'repo-b')
+            self.assertIsNone(request['toSlotId'])
+            self.assertRegex(request['operationId'], r'[0-9a-f]{32}\Z')
+            # The rendered body is exactly what the controller accepts.
+            controller._validate_plan_request(request)
+            # Re-rendering the same move derives the same operationId —
+            # a replay hits the controller's idempotent plan path.
+            replay = console_api.plan_request(snapshot, 'demo',
+                                              'host-b')
+            self.assertEqual(replay['input']['operationId'],
+                             request['operationId'])
+            commands = model['commands']
+            self.assertIn('nexus-controller', commands['plan'])
+            self.assertIn('execute', commands['execute'])
+            self.assertIn(request['operationId'], commands['status'])
+            page = console_api.plan_request_page(snapshot, 'demo',
+                                                 'host-b')
+            self.assertIn(request['operationId'].encode(), page)
+            self.assertIn(b'nexus-controller', page)
+
+    def test_plan_request_reports_nonviable_reasons(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, _ = self._snapshot(directory)
+            model = console_api.plan_request(snapshot, 'demo', 'host-b')
+            codes = {(r['code'], r['severity'], r['source'])
+                     for r in model['reasons']}
+            self.assertFalse(model['viable'])
+            self.assertIn(('retirement-required', 'blocker',
+                           'placement'), codes)
+            # Controller-mirrored check: nothing observed live on the
+            # target, so its session cannot be proven.
+            self.assertIn(('target-session-unproven', 'blocker',
+                           'controller'), codes)
+            # The canonical input still renders — ids are real.
+            self.assertIsNotNone(model['input'])
+            self.assertEqual(model['input']['fromInstanceId'], INSTANCE)
+
+    def test_plan_request_unplaced_and_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, _ = self._snapshot(directory, workloads=[])
+            model = console_api.plan_request(snapshot, 'demo', 'host-b')
+            codes = {r['code'] for r in model['reasons']}
+            self.assertFalse(model['viable'])
+            self.assertIn('workload-not-placed', codes)
+            self.assertIn('plan-input-incomplete', codes)
+            self.assertIsNone(model['input'])
+            self.assertIsNone(model['commands'])
+            model = console_api.plan_request(snapshot, 'missing',
+                                             'host-b')
+            self.assertIn('unknown-workload',
+                          {r['code'] for r in model['reasons']})
+
+    def test_plan_request_without_backup_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # An empty jobs dir: no uploaded copies means the request
+            # cannot name an upload repository.
+            empty = os.path.join(directory, 'empty-backup')
+            os.makedirs(os.path.join(empty, 'jobs'))
+            snapshot, _ = self._snapshot(
+                directory,
+                workloads=[placed(observed_state='retired'),
+                           placed_on('host-b')],
+                backupStateDir=empty)
+            model = console_api.plan_request(snapshot, 'demo', 'host-b')
+            self.assertFalse(model['viable'])
+            self.assertIn('repository-unresolved',
+                          {r['code'] for r in model['reasons']})
+            self.assertIsNone(model['input']['repositoryId'])
+
+    def test_fences_projection_rendered_on_views(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, _ = self._snapshot(directory,
+                                         fences=[fence()])
+            self.assertTrue(snapshot['fences']['available'])
+            self.assertEqual(len(snapshot['fences']['fences']), 1)
+            row = console_api.workload_rows(snapshot)[0]
+            self.assertEqual(row['fence']['evidence'], 'operator')
+            detail = console_api.workload_detail(snapshot, 'demo')
+            self.assertEqual(detail['fencesStatus'], 'ok')
+            self.assertEqual(detail['fences'][0]['attestedBy'],
+                             'operator@console')
+            self.assertEqual(detail['fences'][0]['requestId'],
+                             'aa' * 16)
+            rows = {r['hostId']: r
+                    for r in console_api.host_rows(snapshot)}
+            self.assertEqual(len(rows['host-a']['fences']), 1)
+            self.assertEqual(rows['host-b']['fences'], [])
+            page = console_api.workload_detail_page(snapshot, 'demo')
+            self.assertIn(b'Fence records', page)
+            self.assertIn(b'operator@console', page)
+
+    def test_fences_tampered_or_unexpected_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for bad in ({'workloadId': 'demo'},           # missing fields
+                        dict(fence(), extra=1),            # unexpected field
+                        dict(fence(), evidence='forged'),  # unknown evidence
+                        dict(fence(), generation=0),       # out of range
+                        dict(fence(), requestId='xyz'),    # not hex32
+                        dict(fence(), attestedBy=''),
+                        'not-a-dict'):
+                with self.subTest(bad=bad):
+                    snapshot, _ = self._snapshot(directory,
+                                                 fences=[bad])
+                    self.assertFalse(snapshot['fences']['available'])
+                    self.assertEqual(snapshot['fences']['error'],
+                                     'invalid')
+                    self.assertEqual(snapshot['fences']['fences'], [])
+                    detail = console_api.workload_detail(snapshot,
+                                                         'demo')
+                    self.assertEqual(detail['fencesStatus'], 'invalid')
+                    self.assertEqual(detail['fences'], [])
+            # A non-list fences field rejects the projection likewise.
+            snapshot, _ = self._snapshot(directory, fences='tampered')
+            self.assertEqual(snapshot['fences']['error'], 'invalid')
+            # A registry that predates the projection (no key) is a
+            # legitimately empty view, not an error.
+            legacy = console_api._fence_records(
+                {'available': True, 'data': {'workloads': []}})
+            self.assertTrue(legacy['available'])
+            self.assertEqual(legacy['fences'], [])
+
 
 class HttpTests(unittest.TestCase):
     def setUp(self):
@@ -640,6 +808,11 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b'registry-state-unavailable', body)
         self.assertIn(b'plan preview', body)
+        status, body, _ = self.get('/plan-request?workloadId=demo'
+                                   '&hostId=host-a')
+        self.assertEqual(status, 200)
+        self.assertIn(b'Plan request', body)
+        self.assertIn(b'nexus-controller', body)
 
     def test_json_surface(self):
         status, body, _ = self.get('/api/v1/workloads')
@@ -658,15 +831,34 @@ class HttpTests(unittest.TestCase):
         data = json.loads(body)
         self.assertEqual(data['sources']['catalog']['status'], 'ok')
         self.assertFalse(data['registry']['state']['available'])
+        status, body, _ = self.get(
+            '/api/v1/plan-request?workloadId=demo&hostId=host-a')
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        request = data['request']
+        self.assertEqual(request['targetHostId'], 'host-a')
+        # No registry configured: the request stays unrenderable and
+        # the reason is visible.
+        self.assertFalse(request['viable'])
+        self.assertIsNone(request['input'])
+        self.assertIn('registry-state-unavailable',
+                      {r['code'] for r in request['reasons']})
 
     def test_rejects_mutations_queries_and_unknown_paths(self):
         for method in ('POST', 'PUT', 'DELETE'):
             status, _, _ = self.get('/workloads', method=method)
             self.assertEqual(status, 404, method)
+            status, _, _ = self.get(
+                '/plan-request?workloadId=demo&hostId=host-a',
+                method=method)
+            self.assertEqual(status, 404, method)
         for path in ('/workloads/nonexistent', '/etc/passwd',
                      '/api/v1/move-check?workloadId=%3Cscript%3E'
                      '&hostId=h',
                      '/move-check?workloadId=demo',
+                     '/plan-request?hostId=host-a',
+                     '/api/v1/plan-request?workloadId=%3Cx%3E'
+                     '&hostId=host-a',
                      '/workloads/' + 'a' * 100):
             with self.subTest(path=path):
                 status, _, _ = self.get(path)

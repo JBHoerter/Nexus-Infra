@@ -5,8 +5,10 @@ that service owns browser sessions, CSRF, host-agent polling and its audit
 database. This module is a strictly read-only workload view served on a
 configurable loopback/private bind — there is no login, no session state,
 no POST/PUT/DELETE verb and no mutation path of any kind. Moves are
-rendered as explainable plan previews only; handing an accepted plan to a
-controller is future work and deliberately absent here.
+rendered as explainable plan previews plus a copy-ready ``plan`` request
+body and command sketch — affordance only: a root operator runs
+``nexus-controller`` out of band; this surface cannot reach or dispatch
+to it.
 
 Evidence sources, all consumed read-only:
 
@@ -19,7 +21,11 @@ Evidence sources, all consumed read-only:
 - ``registry`` — ``GET /v2/state``, ``GET /v2/assignments`` and
   ``GET /v2/routes`` over mutual TLS with a configured client identity
   (see registry_api.py; a ``reader`` identity is only authorized for
-  ``/v2/state`` — the other endpoints are rendered as denied, not hidden).
+  ``/v2/state`` — the other endpoints are rendered as denied, not
+  hidden). ``/v2/state``'s ``fences`` projection — operator-posted fence
+  evidence — is validated against the same exact-field contract the
+  controller applies (controller.py ``_validate_fence``) and rendered
+  as provenance on the workload and host views.
 - Per-host ``workers`` state directories — ``worker.db`` opened read-only
   (SQLite ``mode=ro``, no WAL creation, per-table LIMIT queries).
 - ``backupStateDir``/``restoreStateDir`` — ``jobs/<id>.json`` journals
@@ -33,6 +39,7 @@ values, capped rows, and the shared security headers from common.py.
 """
 
 import argparse
+import hashlib
 import html
 import ipaddress
 import json
@@ -81,6 +88,16 @@ _REGISTRY_FIELDS = {'url', 'caFile', 'certFile', 'keyFile',
                     'timeoutSeconds'}
 _WORKER_FIELDS = {'hostId', 'stateDir'}
 _RESOURCE_KEYS = ('memoryMiB', 'cpuMillis', 'stateBytes')
+# The /v2/state ``fences`` projection contract — mirrored read-only from
+# controller.py ``_FENCE_VIEW_FIELDS``/``_validate_fence`` and registry.py
+# ``_FENCE_EVIDENCE``. A tampered or unexpected record rejects the whole
+# projection; it is never rendered partially.
+_FENCE_VIEW_FIELDS = {'workloadId', 'generation', 'hostId', 'evidence',
+                      'attestedBy', 'requestId', 'recordedAt'}
+_FENCE_EVIDENCE = ('quorum-attested', 'operator')
+_MAX_FENCES = 4096
+_MAX_I64 = 2**63 - 1
+_DIGEST_RE = re.compile(r'sha256:[0-9a-f]{64}')
 
 
 # -- bounded strict JSON ----------------------------------------------------
@@ -311,6 +328,82 @@ def _registry_snapshot(reader):
         else:
             out[name] = reader.get(path, nonce=nonce)
     return out
+
+
+def _valid_fence(fence):
+    """One ``fences`` record, validated exactly as
+    ``controller._validate_fence`` validates the same projection before
+    trusting it: exact field set, bounded generation/attester, hex32
+    requestId and a known evidence kind."""
+    if type(fence) is not dict or set(fence) != _FENCE_VIEW_FIELDS:
+        return False
+    try:
+        catalog.identifier(fence['workloadId'], 'fence')
+        catalog.identifier(fence['hostId'], 'fence')
+    except catalog.CatalogError:
+        return False
+    generation = fence['generation']
+    if type(generation) is not int or isinstance(generation, bool) \
+            or not 1 <= generation <= _MAX_I64:
+        return False
+    request_id = fence['requestId']
+    if type(request_id) is not str \
+            or _HEX32_RE.fullmatch(request_id) is None:
+        return False
+    attested_by = fence['attestedBy']
+    recorded_at = fence['recordedAt']
+    return fence['evidence'] in _FENCE_EVIDENCE \
+        and type(attested_by) is str and 0 < len(attested_by) <= 512 \
+        and type(recorded_at) in (int, float) \
+        and not isinstance(recorded_at, bool)
+
+
+def _fence_records(state):
+    """Strictly validated ``fences`` projection of a /v2/state result.
+
+    An absent key means the registry predates the projection — rendered
+    as empty. A malformed list or record rejects the projection as a
+    whole (``error == 'invalid'``), matching how the controller refuses
+    an unexpected registry response rather than trusting part of it."""
+    result = {'available': False, 'error': None, 'fences': []}
+    if not state['available']:
+        result['error'] = state.get('error') or 'unavailable'
+        return result
+    if 'fences' not in state['data']:
+        result['available'] = True
+        return result
+    fences = state['data']['fences']
+    if type(fences) is not list or len(fences) > _MAX_FENCES:
+        result['error'] = 'invalid'
+        return result
+    for fence in fences:
+        if not _valid_fence(fence):
+            result['error'] = 'invalid'
+            result['fences'] = []
+            return result
+    result['available'] = True
+    result['fences'] = [dict(fence) for fence in fences]
+    return result
+
+
+def _fences_status(fences):
+    if fences['available']:
+        return 'ok'
+    return 'invalid' if fences['error'] == 'invalid' else 'unavailable'
+
+
+def _covering_fence(snapshot, workload_id, generation, host_id):
+    """The fence record covering exactly this incumbent
+    (workloadId, generation, hostId), or ``None``."""
+    fences = snapshot['fences']
+    if not fences['available']:
+        return None
+    for fence in fences['fences']:
+        if fence['workloadId'] == workload_id \
+                and fence['generation'] == generation \
+                and fence['hostId'] == host_id:
+            return fence
+    return None
 
 
 # -- journal readers (read-only, this module's own documented read paths) ---
@@ -641,6 +734,7 @@ def collect(config, *, reader=None, now=None):
         snapshot['sources']['restore'] = {
             'status': 'ok' if jobs['available'] else 'error',
             'error': jobs['error']}
+    snapshot['fences'] = _fence_records(snapshot['registry']['state'])
     state = snapshot['registry']['state']
     if state['available']:
         for item in state['data'].get('workloads', []):
@@ -776,6 +870,9 @@ def workload_rows(snapshot):
                 and 0 <= age <= _OBSERVATION_FRESH_SECONDS,
             'readyServices': observation.get('readyServices')
                 if type(observation) is dict else None,
+            'fence': _covering_fence(snapshot, workload_id,
+                                     placement.get('generation'),
+                                     host_id),
             'admission': admission,
             'evaluation': evaluation})
     return rows
@@ -834,12 +931,16 @@ def workload_detail(snapshot, workload_id):
             operations.append({'source': 'restore', 'id': job['id'],
                                'phase': job['phase'],
                                'committedAt': job['committedAt']})
+    fences = snapshot['fences']
     return {'row': row, 'definition': definition, 'points': points,
             'instances': instances, 'operations': operations,
             'stateMounts': definition['stateMounts'] if definition else [],
             'services': definition['services'] if definition else [],
             'allowedOperations': definition['allowedOperations']
-                if definition else []}
+                if definition else [],
+            'fences': [fence for fence in fences['fences']
+                       if fence['workloadId'] == workload_id],
+            'fencesStatus': _fences_status(fences)}
 
 
 def host_rows(snapshot):
@@ -866,6 +967,7 @@ def host_rows(snapshot):
                         freshest is None or observed_at > freshest):
                     freshest = observed_at
         journal = snapshot['workers'].get(host_id)
+        fences = snapshot['fences']
         rows.append({
             'hostId': host_id,
             'architecture': host['architecture'],
@@ -884,7 +986,10 @@ def host_rows(snapshot):
                         'heldCaptures': sum(
                             1 for c in journal['captures']
                             if c['status'] == 'held')}
-                if journal else None})
+                if journal else None,
+            'fences': [fence for fence in fences['fences']
+                       if fence['hostId'] == host_id],
+            'fencesStatus': _fences_status(fences)})
     return rows
 
 
@@ -982,6 +1087,170 @@ def move_check(snapshot, workload_id, host_id):
             'admission': admission}
 
 
+# -- plan request (read-only affordance for the M5 controller) ---------------
+
+def _fresh_observation(entry):
+    """Mirror of ``controller._fresh_observation``: the registry's own
+    staleness classification decides — 'stale'/'lost' carry no usable
+    current-session observation; anything else with one is fresh."""
+    observation = entry.get('observation')
+    if type(observation) is not dict \
+            or entry.get('observedState') in ('stale', 'lost'):
+        return None
+    return observation
+
+
+def _default_repository(snapshot, workload_id):
+    """The repositoryId of the workload's newest uploaded-copy journal
+    evidence — the destination a controller capture would upload to.
+    ``None`` when no evidence exists; the operator then has to pick a
+    repository before the rendered request can run."""
+    best = None
+    for job in snapshot['backupJobs']:
+        if job.get('invalid') or job['workloadId'] != workload_id:
+            continue
+        completed = job.get('captureCompletedAt')
+        if type(completed) is not int:
+            continue
+        for copy_ in job['copies']:
+            repository_id = copy_.get('repositoryId')
+            if type(repository_id) is not str \
+                    or _ID_RE.fullmatch(repository_id) is None:
+                continue
+            if best is None or completed > best[0] \
+                    or (completed == best[0] and repository_id < best[1]):
+                best = (completed, repository_id)
+    return best[1] if best else None
+
+
+def _plan_operation_id(workload_id, from_instance_id, generation,
+                       to_host_id, revision_digest):
+    """Deterministic operationId bound to the move it describes:
+    re-rendering the page yields the same id, so an operator replaying
+    the generated request hits the controller's idempotent plan path
+    instead of opening a duplicate operation."""
+    preimage = json.dumps(
+        {'workloadId': workload_id, 'fromInstanceId': from_instance_id,
+         'generation': generation, 'toHostId': to_host_id,
+         'revisionDigest': revision_digest},
+        sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(b'nexus-console:plan-request:' + preimage
+                          ).hexdigest()[:32]
+
+
+def _plan_commands(request):
+    """Copy-ready text for a root operator. ``nexus-controller`` has a
+    single ``execute`` subcommand reading the request JSON from stdin;
+    ``action`` inside the request selects the verb. All values are
+    strict identifiers/hex digests, so single-quoting is safe."""
+    program = 'nexus-controller --config <controller-config.json> execute'
+
+    def sketch(payload):
+        return "printf '%%s\\n' '%s' | %s" % (payload, program)
+
+    operation_id = request['operationId']
+    return {
+        'plan': sketch(json.dumps(request, sort_keys=True,
+                                  separators=(',', ':'))),
+        'execute': sketch(json.dumps(
+            {'schemaVersion': 1, 'action': 'execute',
+             'operationId': operation_id},
+            sort_keys=True, separators=(',', ':'))),
+        'status': sketch(json.dumps(
+            {'schemaVersion': 1, 'action': 'status',
+             'operationId': operation_id},
+            sort_keys=True, separators=(',', ':')))}
+
+
+def plan_request(snapshot, workload_id, host_id):
+    """Read-only plan-request builder for ``nexus-controller``.
+
+    Returns the compatibility pre-check (move_check layered with a
+    read-only mirror of ``Controller._plan``/``_step_validate``'s
+    registry preconditions — every reason a target is not viable), the
+    exact canonical JSON body a root operator would feed the controller
+    for action ``plan``, copy-ready command text, and the workload's
+    fence provenance. Everything is derived deterministically; nothing
+    is dispatched — the console never reaches the controller."""
+    now = snapshot['generatedAt']
+    check = move_check(snapshot, workload_id, host_id)
+    reasons = [dict(r) for r in check['reasons']]
+
+    def blocker(code, source='controller'):
+        reasons.append({'code': code, 'source': source,
+                        'severity': 'blocker'})
+
+    state = snapshot['registry']['state']
+    placements = _placements(snapshot)
+    placement = placements.get(workload_id)
+    definition = snapshot['definitions'].get(workload_id)
+    host = snapshot['hosts'].get(host_id)
+    if state['available']:
+        if placement is None or placement.get('instanceId') is None:
+            blocker('workload-not-placed')
+        else:
+            if _fresh_observation(placement) is None:
+                blocker('evidence-stale')
+            source_host = placement.get('hostId')
+            if source_host is not None and source_host != host_id \
+                    and not any(
+                        other.get('hostId') == host_id
+                        and _fresh_observation(other) is not None
+                        for other in placements.values()):
+                # controller._step_validate fails closed when no fresh
+                # observation proves the target host's session is live.
+                blocker('target-session-unproven')
+        if definition is not None and host is not None \
+                and host['architecture'] is not None \
+                and definition['architecture'] != host['architecture']:
+            blocker('architecture-mismatch')
+    source_host = placement.get('hostId') if placement else None
+    from_instance = placement.get('instanceId') if placement else None
+    generation = placement.get('generation') if placement else None
+    if definition is not None:
+        revision_digest = definition['revisionDigest']
+    elif placement is not None:
+        revision_digest = placement.get('revisionDigest')
+    else:
+        revision_digest = None
+    repository_id = _default_repository(snapshot, workload_id)
+    complete = type(from_instance) is str \
+        and _HEX32_RE.fullmatch(from_instance) is not None \
+        and type(revision_digest) is str \
+        and _DIGEST_RE.fullmatch(revision_digest) is not None \
+        and type(generation) is int \
+        and not isinstance(generation, bool) \
+        and 1 <= generation <= _MAX_I64
+    if repository_id is None:
+        blocker('repository-unresolved', 'plan-request')
+    if not complete:
+        blocker('plan-input-incomplete', 'plan-request')
+        request = None
+    else:
+        request = {'schemaVersion': 1, 'action': 'plan',
+                   'operationId': _plan_operation_id(
+                       workload_id, from_instance, generation,
+                       host_id, revision_digest),
+                   'workloadId': workload_id,
+                   'revisionDigest': revision_digest,
+                   'fromInstanceId': from_instance,
+                   'toHostId': host_id, 'toSlotId': None,
+                   'repositoryId': repository_id}
+    fences = snapshot['fences']
+    return {'workloadId': workload_id, 'sourceHostId': source_host,
+            'targetHostId': host_id, 'generation': generation,
+            'checkedAt': now,
+            'viable': request is not None
+                and not any(r['severity'] == 'blocker' for r in reasons),
+            'reasons': reasons,
+            'input': request,
+            'commands': _plan_commands(request)
+                if request is not None else None,
+            'fences': [fence for fence in fences['fences']
+                       if fence['workloadId'] == workload_id],
+            'fencesStatus': _fences_status(fences)}
+
+
 # -- HTML rendering -----------------------------------------------------------
 
 def esc(value):
@@ -1013,6 +1282,7 @@ tr:last-child td{border-bottom:none}
 .badge.warn{border-color:#7a5b22;background:#2a2110;color:#ecc76b}
 .badge.bad{border-color:#7c3131;background:#2a1414;color:#f08b8b}
 .mono,code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+pre.mono{display:block;background:#0a0d11;border:1px solid #232a35;border-radius:8px;padding:12px;overflow:auto;white-space:pre-wrap;word-break:break-all}
 .muted{color:#8b96a2}
 .reasons{margin:4px 0 0;padding:0;list-style:none}
 .reasons li{display:inline-block;margin:2px 4px 2px 0;padding:1px 8px;border-radius:6px;background:#241a2b;border:1px solid #463052;color:#d5aef0;font-size:12px}
@@ -1110,6 +1380,8 @@ def _source_notes(snapshot):
     for name, result in sorted(snapshot['registry'].items()):
         if not result['available']:
             notes.append('registry %s: %s' % (name, esc(result['error'])))
+    if snapshot['fences']['error'] == 'invalid':
+        notes.append('registry fences: invalid projection')
     if not notes:
         return ''
     return '<p class="note">Degraded sources — %s.</p>' % '; '.join(notes)
@@ -1155,6 +1427,9 @@ def workloads_page(snapshot):
                        else state_tone)
         state += ' <span class="muted">%s</span>' % esc(
             _age(row['observedAt'], now))
+        if row['fence'] is not None:
+            state += ' ' + _badge('fenced: %s' % row['fence']['evidence'],
+                                  'warn')
         table_rows.append([
             '<a href="/workloads/%s"><strong>%s</strong></a>'
             '<br><span class="muted">%s · %s</span>'
@@ -1197,6 +1472,7 @@ def workload_detail_page(snapshot, workload_id):
         fields.append('<div class="kv"><span>%s</span>'
                       '<span>%s</span></div>' % (esc(label), rendered))
     move_form = ''
+    plan_form = ''
     if definition is not None and snapshot['hosts']:
         options = ''.join('<option value="%s">%s</option>'
                           % (esc(h), esc(h))
@@ -1207,6 +1483,13 @@ def workload_detail_page(snapshot, workload_id):
             '<label class="muted">Check move to</label> '
             '<select name="hostId">%s</select> '
             '<button type="submit">Explain</button></form>'
+            % (esc(workload_id), options))
+        plan_form = (
+            '<form method="get" action="/plan-request">'
+            '<input type="hidden" name="workloadId" value="%s">'
+            '<label class="muted">Plan request to</label> '
+            '<select name="hostId">%s</select> '
+            '<button type="submit">Build request</button></form>'
             % (esc(workload_id), options))
     mounts = _table(
         ('Mount id', 'Guest path', 'Owner', 'Consistency'),
@@ -1242,19 +1525,34 @@ def workload_detail_page(snapshot, workload_id):
           esc(o.get('workloadId') or ''),
           esc(o.get('status') or o.get('phase'))]
          for o in detail['operations'][:_MAX_ROWS]])
+    fences = _table(
+        ('Generation', 'Host', 'Evidence', 'Attested by', 'Request',
+         'Recorded'),
+        [[esc(f['generation']), esc(f['hostId']),
+          esc(f['evidence']), esc(f['attestedBy']),
+          '<code>%s</code>' % esc(f['requestId']),
+          esc(_stamp(f['recordedAt']))]
+         for f in detail['fences'][:_MAX_ROWS]])
+    if detail['fencesStatus'] != 'ok':
+        fences = _badge('fences %s' % detail['fencesStatus'], 'warn') \
+            + fences
     body = ('<h1>%s</h1><p class="sub">%s · %s</p>'
             '<div class="grid"><div class="panel"><h2>Identity and '
             'placement</h2>%s</div>'
             '<div class="panel"><h2>Move check</h2><p class="muted">'
             'Explainable preview only — nothing is planned or executed.'
-            '</p>%s</div></div>'
+            '</p>%s%s</div></div>'
             '<div class="panel"><h2>State mounts</h2>%s</div>'
             '<div class="panel"><h2>Recovery points</h2>%s</div>'
             '<div class="panel"><h2>Known placements and captures</h2>%s</div>'
             '<div class="panel"><h2>Operations</h2>%s</div>'
+            '<div class="panel"><h2>Fence records</h2><p class="muted">'
+            'Operator-posted fence evidence from the registry — '
+            'provenance only.</p>%s</div>'
             % (esc(row['displayName']), esc(row['workloadId']),
                esc(row['category']), ''.join(fields), move_form,
-               mounts, points, placements, operations))
+               plan_form, mounts, points, placements, operations,
+               fences))
     return _page('Workloads', body, now)
 
 
@@ -1281,6 +1579,16 @@ def hosts_page(snapshot):
                       % ('readable' if journal['available']
                          else 'unavailable (%s)' % journal['error'],
                          journal['instances'], journal['heldCaptures'])))
+        fence_lines = ''.join(
+            '<div class="kv"><span>Fence %s gen %s</span>'
+            '<span>%s</span></div>'
+            % (esc(f['workloadId']), esc(f['generation']),
+               esc('%s · %s · %s' % (f['evidence'], f['attestedBy'],
+                                     _stamp(f['recordedAt']))))
+            for f in row['fences'][:8])
+        if row['fencesStatus'] != 'ok':
+            fence_lines = _badge(
+                'fences %s' % row['fencesStatus'], 'warn') + fence_lines
         cards.append(
             '<div class="panel"><h2>%s %s</h2>'
             '<div class="kv"><span>Architecture</span><span>%s</span></div>'
@@ -1289,14 +1597,15 @@ def hosts_page(snapshot):
             '</span></div>%s'
             '<div class="kv"><span>Registry instances</span><span>%d</span>'
             '</div><div class="kv"><span>Latest observation</span><span>%s'
-            '</span></div>%s</div>'
+            '</span></div>%s%s</div>'
             % (esc(row['hostId']),
                '' if row['configured'] else _badge('unconfigured', 'warn'),
                esc(row['architecture']),
                esc(', '.join(row['capabilities']) or '—'),
                evidence, esc(_age(row['evidenceObservedAt'], now)),
                capacity, row['observedInstances'],
-               esc(_stamp(row['latestObservationAt'])), journal_line))
+               esc(_stamp(row['latestObservationAt'])), journal_line,
+               fence_lines))
     body = ('<h1>Hosts</h1><p class="sub">Admission capability records, '
             'capacity-evidence freshness and observed instances.</p>'
             '<div class="grid">%s</div>%s'
@@ -1353,6 +1662,66 @@ def move_check_page(snapshot, workload_id, host_id):
     return _page('Move check', body, now)
 
 
+def plan_request_page(snapshot, workload_id, host_id):
+    now = snapshot['generatedAt']
+    model = plan_request(snapshot, workload_id, host_id)
+    verdict = _badge('viable — request generated below',
+                     'ok') if model['viable'] else \
+        _badge('not viable as recorded', 'bad')
+    rows = [[_badge(r['severity'],
+                    'bad' if r['severity'] == 'blocker' else 'warn'),
+             esc(r['code']), esc(r['source'])]
+            for r in model['reasons']]
+    if model['input'] is None:
+        request_html = ('<p class="muted">No runnable request: resolve '
+                        'the blockers above first — no canonical '
+                        'controller input can be derived.</p>')
+        command_html = ''
+    else:
+        request_html = '<pre class="mono">%s</pre>' % esc(
+            json.dumps(model['input'], indent=2, sort_keys=True))
+        command_html = ''.join(
+            '<h2>%s</h2><pre class="mono">%s</pre>'
+            % (esc(label), esc(command))
+            for label, command in (
+                ('Plan — validate and journal only',
+                 model['commands']['plan']),
+                ('Execute — run the journaled operation',
+                 model['commands']['execute']),
+                ('Status — inspect the journaled operation',
+                 model['commands']['status'])))
+    fences = _table(
+        ('Generation', 'Host', 'Evidence', 'Attested by', 'Request',
+         'Recorded'),
+        [[esc(f['generation']), esc(f['hostId']), esc(f['evidence']),
+          esc(f['attestedBy']), '<code>%s</code>' % esc(f['requestId']),
+          esc(_stamp(f['recordedAt']))]
+         for f in model['fences'][:_MAX_ROWS]])
+    if model['fencesStatus'] != 'ok':
+        fences = _badge('fences %s' % model['fencesStatus'], 'warn') \
+            + fences
+    body = ('<h1>Plan request</h1><p class="sub">%s → %s · generated '
+            'request text for a root operator to run '
+            '<code>nexus-controller</code> with — this console cannot '
+            'dispatch anything.</p>'
+            '<div class="panel"><h2>Compatibility %s</h2>%s</div>'
+            '<div class="panel"><h2>Controller plan input</h2>'
+            '<p class="muted">Canonical request body for '
+            '<code>nexus-controller execute</code> (action '
+            '<code>plan</code>); generated deterministically, safe to '
+            're-render.</p>%s</div>'
+            '<div class="panel"><h2>Operator commands</h2>'
+            '<p class="muted">Copy-ready for a root shell on the '
+            'controller host; each request goes to the CLI\'s single '
+            '<code>execute</code> subcommand on stdin.</p>%s</div>'
+            '<div class="panel"><h2>Fence provenance</h2>%s</div>%s'
+            % (esc(workload_id), esc(host_id), verdict,
+               _table(('Severity', 'Reason', 'Source'), rows),
+               request_html, command_html, fences,
+               _source_notes(snapshot)))
+    return _page('Plan request', body, now)
+
+
 # -- HTTP surface ------------------------------------------------------------
 
 def _json_ready(value):
@@ -1399,9 +1768,11 @@ def make_handler(config, reader):
             detail = re.fullmatch(r'/(?:api/v1/)?workloads/'
                                   r'([a-z][a-z0-9-]{0,62})', path)
             known = path in ('/workloads', '/hosts', '/operations',
-                             '/move-check', '/api/v1/workloads',
-                             '/api/v1/hosts', '/api/v1/operations',
-                             '/api/v1/sources', '/api/v1/move-check') \
+                             '/move-check', '/plan-request',
+                             '/api/v1/workloads', '/api/v1/hosts',
+                             '/api/v1/operations', '/api/v1/sources',
+                             '/api/v1/move-check',
+                             '/api/v1/plan-request') \
                 or detail is not None
             if not known:
                 raise common.HTTPError(404, 'Unknown endpoint')
@@ -1434,6 +1805,14 @@ def make_handler(config, reader):
                 return self.send(200, move_check_page(
                     snapshot, query['workloadId'], query['hostId']),
                     'text/html; charset=utf-8')
+            if path == '/plan-request':
+                for key in ('workloadId', 'hostId'):
+                    value = query.get(key)
+                    if value is None or _ID_RE.fullmatch(value) is None:
+                        raise common.HTTPError(400, 'Invalid ' + key)
+                return self.send(200, plan_request_page(
+                    snapshot, query['workloadId'], query['hostId']),
+                    'text/html; charset=utf-8')
             if path == '/api/v1/workloads':
                 return self.send(200, _json_ready(
                     {'schemaVersion': 1,
@@ -1460,6 +1839,16 @@ def make_handler(config, reader):
                         raise common.HTTPError(400, 'Invalid ' + key)
                 return self.send(200, _json_ready(move_check(
                     snapshot, query['workloadId'], query['hostId'])))
+            if path == '/api/v1/plan-request':
+                for key in ('workloadId', 'hostId'):
+                    value = query.get(key)
+                    if value is None or _ID_RE.fullmatch(value) is None:
+                        raise common.HTTPError(400, 'Invalid ' + key)
+                return self.send(200, _json_ready(
+                    {'schemaVersion': 1,
+                     'request': plan_request(
+                         snapshot, query['workloadId'],
+                         query['hostId'])}))
             raise common.HTTPError(404, 'Unknown endpoint')
 
     for verb in ('POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'):
