@@ -572,15 +572,26 @@ class ViewTests(unittest.TestCase):
             snapshot, _ = self._snapshot(
                 directory, catalogFile=catalog_file,
                 workloads=[placed(observed_state='retired')])
-            for workload_id, expected in (
-                    ('old-app', {'workload-archived',
-                                 'operation-not-allowed:move'}),
-                    ('vaulted', {'secret-provisioning-unavailable'})):
-                result = console_api.move_check(snapshot, workload_id,
-                                                'host-b')
-                self.assertTrue(expected <=
-                                {r['code'] for r in result['reasons']})
-                self.assertFalse(result['eligible'])
+            result = console_api.move_check(snapshot, 'old-app',
+                                            'host-b')
+            self.assertTrue({'workload-archived',
+                             'operation-not-allowed:move'} <=
+                            {r['code'] for r in result['reasons']})
+            self.assertFalse(result['eligible'])
+            # A secrets-bearing definition is no longer a blocker —
+            # provisioning capability is per-host worker config the
+            # console cannot see — but the preview honestly reports it
+            # cannot verify that capability; the worker stays
+            # fail-closed when the secrets trio is absent.
+            result = console_api.move_check(snapshot, 'vaulted',
+                                            'host-b')
+            reasons = {(r['code'], r['severity'], r['source'])
+                       for r in result['reasons']}
+            self.assertIn(('secret-provisioning-unverifiable',
+                           'warning', 'definition'), reasons)
+            self.assertNotIn('secret-provisioning-unavailable',
+                             {r['code'] for r in result['reasons']})
+            self.assertTrue(result['eligible'])
 
     def test_move_check_dependency_readiness(self):
         """A dep-having workload reports the controller's typed dep

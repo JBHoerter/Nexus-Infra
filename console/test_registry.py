@@ -199,6 +199,21 @@ class ConfigValidationTests(unittest.TestCase):
                     digest=infra_def['revisionDigest']))
             self.assertEqual(ctx.exception.code, 'workload-not-mutable')
 
+    def test_secret_bearing_definition_assignable(self):
+        """``secretSetRef`` is not a registry gate: per-host secrets
+        provisioning capability is worker configuration the registry
+        cannot see — the worker stays fail-closed without its trio."""
+        with tempfile.TemporaryDirectory() as tmp:
+            secret_def, _ = sealed_fixture(secretSetRef='ops-secrets')
+            reg, _ = make_registry(tmp, config={
+                'schemaVersion': 2, 'definitions': [secret_def],
+                'hosts': [copy.deepcopy(HOST_A), copy.deepcopy(HOST_B)],
+                'routes': []})
+            result = reg.assign(CONTROLLER, assign_request(
+                digest=secret_def['revisionDigest']))
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['generation'], 1)
+
 
 class LifecycleTests(unittest.TestCase):
     def test_initial_assign_generation1(self):

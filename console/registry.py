@@ -623,12 +623,17 @@ class Registry:
         return needed <= set(payload['readyServices'])
 
     def _executable(self, definition):
+        """Definition-level mutability gate for placement writes.
+
+        ``secretSetRef`` is deliberately NOT checked here: secrets
+        provisioning capability is per-host worker configuration the
+        registry cannot see — the worker itself stays fail-closed with
+        ``secret-provisioning-unavailable`` when its
+        program/config/bundleDir trio is absent."""
         if definition['category'] in ('archive', 'infrastructure'):
             raise RegistryError('workload-not-mutable', 409)
         if 'start' not in definition['allowedOperations']:
             raise RegistryError('operation-not-allowed', 409)
-        if definition['secretSetRef'] is not None:
-            raise RegistryError('secret-provisioning-unavailable', 409)
 
     def _dependencies_ready(self, workload_id, revision_digest,
                             now, mono):

@@ -1165,7 +1165,13 @@ def move_check(snapshot, workload_id, host_id):
                 blocker('operation-not-allowed:' + operation,
                         'definition')
         if definition['secretSetRef'] is not None:
-            blocker('secret-provisioning-unavailable', 'definition')
+            # Secrets provisioning capability is per-host worker
+            # configuration (the secrets trio plus the escrowed bundle)
+            # the console cannot see — the worker fails closed with
+            # ``secret-provisioning-unavailable``/``secrets-bundle-*``
+            # when it is absent. Warn honestly rather than fabricate a
+            # definition blocker.
+            warning('secret-provisioning-unverifiable', 'definition')
         if definition['dependencies']:
             reasons.extend(_dependency_reasons(snapshot, definition))
     if host is None:

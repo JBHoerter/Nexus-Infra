@@ -140,11 +140,13 @@ def _executable(definition):
     controller's verified closure plus the worker's
     ``dependenciesResolved`` marker) — it already ran before the
     workload could be placed and reported running, and the registry
-    only emits a backend on exactly that fresh ready evidence. Routing
-    is not the layer that owns the dep gate."""
+    only emits a backend on exactly that fresh ready evidence.
+    ``secretSetRef`` is not re-checked either, for the same reason:
+    provisioning capability is per-host worker configuration, so a
+    running instance is itself the proof the worker's secrets gate
+    passed. Routing is not the layer that owns either gate."""
     return definition['category'] not in ('archive', 'infrastructure') \
-        and 'start' in definition['allowedOperations'] \
-        and definition['secretSetRef'] is None
+        and 'start' in definition['allowedOperations']
 
 
 def _backend(row, backend, definitions, hosts):
