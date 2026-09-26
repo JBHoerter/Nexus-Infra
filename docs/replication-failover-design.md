@@ -55,7 +55,14 @@ replication must be at block/filesystem level.
    pre-existing instance dir; failover must validate/adopt the
    replicated dir (strict validation — this weakens a deliberate
    invariant). Keep slot `uidBase` symmetric on failover pairs to avoid
-   idmap translation on adopt.
+   idmap translation on adopt. Provisioned secrets ride inside the
+   replicated instance dir (`secrets/` plus the `.nexus-secrets`
+   binding marker — outside the declared `stateMount` leaves, so never
+   captured by backup), so a replica already carries everything the
+   workload needs to start: adoption requires the pair present,
+   slot-owned and bound to the local escrow envelope, and never
+   reprovisions — an incomplete or foreign replica is rejected rather
+   than silently re-seeded.
 3. Mount ordering becomes `drbd-primary → mount → unit`
    (`RequiresMountsFor` alone does not promote).
 4. Reporter: honor superseded generations by forcing local retire.

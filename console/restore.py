@@ -744,7 +744,11 @@ class RestoreWorker:
     def _check_fresh_leaves(self, context):
         """A fresh claim requires exactly the prepared empty mount
         leaves — the sentinel and staging area are only ever added by
-        this worker itself."""
+        this worker itself. A secrets-bearing definition additionally
+        carries the provisioned ``secrets/`` dir and its marker: both
+        must be present and correctly owned, because a restore swaps
+        only state leaves — secrets stay untouched, and the marker is
+        what the manifest's ``secretBundle`` is checked against."""
         instance_dir = context['instanceDir']
         slot = context['slot']
         st = _lstat_or_none(instance_dir)
@@ -758,8 +762,23 @@ class RestoreWorker:
             raise RestoreError('path-unavailable') from None
         mounts = {mount['id']: mount
                   for mount in context['definition']['stateMounts']}
-        if names != set(mounts):
+        extras = worker._secrets_names(context['definition'])
+        if names != set(mounts) | extras:
             raise RestoreError('storage-state-conflict')
+        for name in extras:
+            path = os.path.join(instance_dir, name)
+            st = _lstat_or_none(path)
+            if name == worker._SECRETS_DIR:
+                if st is None or not stat.S_ISDIR(st.st_mode) \
+                        or stat.S_ISLNK(st.st_mode) \
+                        or st.st_uid != slot['uidBase'] \
+                        or st.st_gid != slot['uidBase'] \
+                        or stat.S_IMODE(st.st_mode) != 0o700:
+                    raise RestoreError('storage-state-conflict')
+            elif st is None or not stat.S_ISREG(st.st_mode) \
+                    or st.st_uid != os.geteuid() \
+                    or stat.S_IMODE(st.st_mode) != 0o600:
+                raise RestoreError('storage-state-conflict')
         for mount_id, mount in mounts.items():
             leaf = os.path.join(instance_dir, mount_id)
             st = _lstat_or_none(leaf)
@@ -801,6 +820,25 @@ class RestoreWorker:
                 raise RestoreError('restore-incomplete')
 
     # -- stage ------------------------------------------------------------
+
+    def _check_secrets_bound(self, context, manifest):
+        """The instance's provisioned secrets must be exactly the
+        bundle the recovery point pins: the worker's ``.nexus-secrets``
+        marker holds the same canonical binding triple the manifest
+        carries as ``secretBundle``, so a mismatch means the point was
+        captured from a different bundle version than the instance
+        provisioned — restore refuses rather than silently running new
+        state against old secrets."""
+        if context['definition']['secretSetRef'] is None:
+            return
+        marker = os.path.join(context['instanceDir'],
+                              worker._SECRETS_MARKER)
+        try:
+            value = statefiles.read_json(marker, _MAX_SENTINEL_BYTES)
+        except statefiles.PathError as error:
+            raise RestoreError(error.code) from None
+        if value != manifest['secretBundle']:
+            raise RestoreError('secrets-conflict')
 
     def _translate(self, job, context):
         """Extract the bound snapshot and copy its state tree through
@@ -883,6 +921,7 @@ class RestoreWorker:
         fresh = job is None
         try:
             _repo, record = self._verify_point(request, job)
+            self._check_secrets_bound(context, record['manifest'])
             if fresh:
                 job = {
                     'schemaVersion': 1, 'request': dict(request),

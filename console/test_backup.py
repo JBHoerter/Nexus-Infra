@@ -98,11 +98,15 @@ class FakeMounts:
         self.mounted.append((source, target))
         shutil.copytree(source, target, dirs_exist_ok=True)
         self._views[target] = list(os.listdir(target))
+        # A bind mount shows the source leaf's own ownership at the
+        # mountpoint; test fixtures model slot-owned leaves.
+        self.owned[target] = (UID_BASE, UID_BASE)
         for name in os.listdir(target):
             self.owned[os.path.join(target, name)] = (UID_BASE, UID_BASE)
 
     def unmount(self, target):
         self.unmounted.append(target)
+        self.owned.pop(target, None)
         for name in self._views.pop(target, []):
             path = os.path.join(target, name)
             self.owned.pop(path, None)
@@ -597,11 +601,12 @@ class CaptureTests(BackupFixture):
             sealed(secretSetRef='secrets'))
         self.fake_worker.definitions[('demo', REVISION)] = definition
         response = self.capture()
-        self.expect_blocked(response, 'invalid-capture')
+        self.expect_blocked(response, 'secrets-missing')
         self.assertFalse(self.fake_mounts.mounted)
         backup_calls = [call for call in self.cache_fake.calls
                         if 'backup' in call]
         self.assertFalse(backup_calls)
+        self.assertFalse(os.path.exists(self.job_path()))
 
     def test_capture_mount_failure_keeps_pending(self):
         self.fake_mounts.fail_mount = True

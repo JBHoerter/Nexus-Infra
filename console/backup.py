@@ -57,8 +57,8 @@ _CAPTURE_FIELDS = {'schemaVersion', 'action', 'captureId', 'workloadId',
 _UPLOAD_FIELDS = {'schemaVersion', 'action', 'captureId', 'repositoryId'}
 _STATUS_FIELDS = {'schemaVersion', 'action', 'captureId'}
 _JOB_FIELDS = {'schemaVersion', 'request', 'configDigest',
-               'sourceBinding', 'definition', 'source', 'capture',
-               'phase', 'cache', 'copies'}
+               'sourceBinding', 'definition', 'source', 'secretBundle',
+               'capture', 'phase', 'cache', 'copies'}
 _RECEIPT_FIELDS = {'schemaVersion', 'repositoryId', 'repositoryIdentity',
                    'snapshotId', 'manifest'}
 _INTERNAL_ERRORS = (OSError, ValueError, KeyError, TypeError,
@@ -465,9 +465,12 @@ def _validate_job(value, capture_id):
         probe = recovery.build_manifest(
             definition, source, probe_capture,
             state_tree_digests=placeholder,
-            state_set_digest='sha256:' + '0' * 64)
+            state_set_digest='sha256:' + '0' * 64,
+            secret_bundle=value['secretBundle'])
     except (recovery.RecoveryError, KeyError, TypeError):
         raise BackupError('journal-invalid') from None
+    if probe['secretBundle'] != value['secretBundle']:
+        raise BackupError('journal-invalid')
     definition = probe['definition']
     source = probe['source']
     if definition['workloadId'] != value['request']['workloadId'] \
@@ -664,9 +667,24 @@ class BackupWorker:
                   'instanceId': rec['instance_id'],
                   'generation': rec['generation'],
                   'uidBase': binding['slot']['uidBase']}
+        secret_bundle = None
+        if definition['secretSetRef'] is not None:
+            # The worker's durable marker is exactly the canonical
+            # binding triple the recovery manifest must carry — the
+            # frozen instance's provisioned secrets, not the escrow
+            # record, are what the point binds. A missing or malformed
+            # marker means the instance was never fully provisioned.
+            marker = os.path.join(source_dir, worker._SECRETS_MARKER)
+            try:
+                secret_bundle = statefiles.read_json(
+                    marker, _MAX_JOB_BYTES)
+            except statefiles.PathError as error:
+                raise BackupError(error.code) from None
+            if secret_bundle is None:
+                raise BackupError('secrets-missing')
         return {'rec': rec, 'definition': definition,
                 'sourceBinding': binding, 'source': source,
-                'sourceDir': source_dir}
+                'sourceDir': source_dir, 'secretBundle': secret_bundle}
 
     def _local_repo_paths(self):
         paths = [self._config['stateDir'],
@@ -810,7 +828,8 @@ class BackupWorker:
         context = self._worker_snapshot(job['request'])
         if context['definition'] != job['definition'] \
                 or context['source'] != job['source'] \
-                or context['sourceBinding'] != job['sourceBinding']:
+                or context['sourceBinding'] != job['sourceBinding'] \
+                or context['secretBundle'] != job['secretBundle']:
             raise BackupError('capture-conflict')
         self._check_source_mounts(context['sourceDir'])
         if job['capture']['completedAt'] is None:
@@ -853,6 +872,7 @@ class BackupWorker:
                 'sourceBinding': context['sourceBinding'],
                 'definition': context['definition'],
                 'source': context['source'],
+                'secretBundle': context['secretBundle'],
                 'capture': {'adapter': 'quiesce-v1',
                             'consistency': 'quiesced',
                             'startedAt': self._now(),
@@ -871,14 +891,16 @@ class BackupWorker:
                 recovery.build_manifest(
                     job['definition'], job['source'], provisional,
                     state_tree_digests=placeholder,
-                    state_set_digest='sha256:' + '0' * 64)
+                    state_set_digest='sha256:' + '0' * 64,
+                    secret_bundle=job['secretBundle'])
             except (recovery.RecoveryError, KeyError, TypeError):
                 raise BackupError('invalid-capture') from None
             self._save_job(job)
         context = self._worker_snapshot(request)
         if context['definition'] != job['definition'] \
                 or context['source'] != job['source'] \
-                or context['sourceBinding'] != job['sourceBinding']:
+                or context['sourceBinding'] != job['sourceBinding'] \
+                or context['secretBundle'] != job['secretBundle']:
             raise BackupError('capture-conflict')
         self._check_source_boundaries(context['sourceDir'])
         # The provisional completedAt (= startedAt) only proves the
@@ -886,13 +908,21 @@ class BackupWorker:
         # returned dict is what the sealed manifest binds.
         provisional = dict(job['capture'])
         provisional['completedAt'] = job['capture']['startedAt']
-        scratch = self._prepare_scratch(request['captureId'])
-        mounted = False
+        scratch = self._prepare_scratch(request['captureId'],
+                                        job['definition'])
+        mounted = []
         try:
             self._check_source_mounts(context['sourceDir'])
-            self._mounts.mount(context['sourceDir'],
-                               os.path.join(scratch, 'state'))
-            mounted = True
+            # Exactly the declared stateMount leaves are bound into the
+            # staging tree — never the whole instance dir, so worker
+            # metadata (restore sentinel, staging area, provisioned
+            # secrets and their marker) can never leak into a capture.
+            for mount in job['definition']['stateMounts']:
+                target = os.path.join(scratch, 'state', mount['id'])
+                self._mounts.mount(
+                    os.path.join(context['sourceDir'], mount['id']),
+                    target)
+                mounted.append(target)
             result = self.runner.run(
                 ['sync', '-f', context['sourceDir']], timeout=60)
             if result.returncode != 0:
@@ -906,6 +936,7 @@ class BackupWorker:
                     scratch, job['definition'], job['source'],
                     provisional,
                     capture_id=request['captureId'],
+                    secret_bundle=job['secretBundle'],
                     capture_finished=lambda: self._persist_completed(job))
             except repository.RepositoryError as error:
                 raise BackupError(error.code) from None
@@ -923,8 +954,8 @@ class BackupWorker:
             job['phase'] = 'captured'
             self._save_job(job)
         finally:
-            if mounted:
-                self._mounts.unmount(os.path.join(scratch, 'state'))
+            for target in reversed(mounted):
+                self._mounts.unmount(target)
         return {'schemaVersion': 1, 'status': 'completed',
                 'action': 'capture',
                 'captureId': request['captureId'], 'record': receipt}
@@ -944,7 +975,7 @@ class BackupWorker:
             raise BackupError(error.code) from None
         return receipt
 
-    def _prepare_scratch(self, capture_id):
+    def _prepare_scratch(self, capture_id, definition):
         scratch = os.path.join(self._scratch_dir, capture_id)
         _ensure_private_dir(scratch)
         try:
@@ -955,11 +986,33 @@ class BackupWorker:
             raise BackupError('path-unsafe')
         state = os.path.join(scratch, 'state')
         _ensure_private_dir(state)
+        # One private mount target per declared leaf, created before
+        # the binds land; a leftover from a crashed attempt is only
+        # acceptable as an empty same-shaped dir.
+        mounts = {mount['id'] for mount in definition['stateMounts']}
         try:
-            if os.listdir(state):
-                raise BackupError('path-unsafe')
+            children = set(os.listdir(state))
         except OSError:
             raise BackupError('path-unavailable') from None
+        if not children <= mounts:
+            raise BackupError('path-unsafe')
+        for name in children:
+            st = _lstat(os.path.join(state, name))
+            if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) \
+                    or st.st_uid != os.geteuid() \
+                    or stat.S_IMODE(st.st_mode) != 0o700:
+                raise BackupError('path-unsafe')
+            try:
+                if os.listdir(os.path.join(state, name)):
+                    raise BackupError('path-unsafe')
+            except OSError:
+                raise BackupError('path-unavailable') from None
+        for name in mounts - children:
+            try:
+                os.mkdir(os.path.join(state, name), 0o700)
+            except OSError:
+                raise BackupError('path-unavailable') from None
+        _fsync_dir(state)
         return scratch
 
     # -- upload -----------------------------------------------------------

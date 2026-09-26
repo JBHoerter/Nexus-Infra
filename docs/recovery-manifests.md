@@ -81,7 +81,13 @@ the future authorized transport and evidence records.
 - `secretBundle` is present exactly when the definition declares a
   `secretSetRef`, and then carries only `{secretSetRef, versionDigest,
   bundleDigest}` — encrypted-bundle/version references, never key material
-  and no recoverability claim.
+  and no recoverability claim. The worker writes the same canonical triple
+  as the durable `.nexus-secrets` marker next to the provisioned
+  `<instanceDir>/secrets` dir at prepare time; `nexus-backup` reads that
+  marker to bind the captured point, and `nexus-restore` requires the
+  target instance's marker to equal the manifest's `secretBundle` before
+  staging — so a point can never be installed against a differently
+  bundled secret version.
 
 ## Canonical encoding
 

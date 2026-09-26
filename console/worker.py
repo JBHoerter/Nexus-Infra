@@ -18,6 +18,21 @@ always explicit: no component performs it automatically, and there is
 no automatic failover trigger here — a future authorized failover
 controller (or operator) issues the request
 (docs/replication-failover-design.md).
+
+Secret provisioning. A definition carrying ``secretSetRef`` makes the
+worker unseal the host-escrowed bundle into ``<instanceDir>/secrets``
+during prepare: the pinned ``secretsProgram`` (``nexus-secrets
+provision``) runs once per instance under the same journal boundary as
+state-dir allocation, output is post-verified, everything is chowned to
+the slot's ``uidBase`` and the canonical binding triple is durably
+journaled as the ``.nexus-secrets`` marker. The directory is mounted
+read-only at ``/run/secrets`` in the container and deliberately lives
+inside the replicated instance dir: it is never captured as workload
+state (backup binds only declared ``stateMount`` leaves) but travels
+with a DRBD replica, so ``adopt`` requires — and never rewrites — a
+valid marker-bound secrets dir. A secrets-bearing definition without
+the full program/config/bundleDir trio stays rejected with
+``secret-provisioning-unavailable``.
 """
 import argparse
 import base64
@@ -28,6 +43,8 @@ import ipaddress
 import json
 import os
 import re
+import selectors
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -74,6 +91,26 @@ _RESTORE_SENTINEL = '.nexus-restore-pending'
 # name is shared with restore.py — keep them identical). Adoption of a
 # replicated dir tolerates exactly these extras; anything else conflicts.
 _ADOPT_OWN_FILES = frozenset({_RESTORE_SENTINEL, '.nexus-restore-staging'})
+# Provisioned secrets live inside the instance dir as ``secrets/`` —
+# inside the replicated storage tree so a DRBD failover carries them,
+# but never part of a backup capture, which binds only the declared
+# ``stateMount`` leaves. The durable ``.nexus-secrets`` marker holds the
+# canonical manifest binding triple ({secretSetRef, versionDigest,
+# bundleDigest}); a marker matching the escrowed envelope is what makes
+# an already-populated dir resumable instead of a teardown/reprovision.
+_SECRETS_DIR = 'secrets'
+_SECRETS_MARKER = '.nexus-secrets'
+_SECRETS_MOUNT = '/run/secrets'
+_SECRET_BINDING_FIELDS = frozenset(
+    {'secretSetRef', 'versionDigest', 'bundleDigest'})
+_SECRET_RECORD_FIELDS = frozenset({'schemaVersion', 'envelope', 'binding'})
+_SECRET_RECORD_MAX = 64 * 1024
+_SECRET_MARKER_MAX = 4096
+_SECRETS_CLI_TIMEOUT = 120
+_SECRETS_CLI_MAX_OUTPUT = 64 * 1024
+# All-or-none worker config trio; all values are absolute paths.
+_CONFIG_SECRETS = ('secretsProgram', 'secretsConfigFile',
+                   'secretsBundleDir')
 
 
 def _fields(value, expected, context):
@@ -126,6 +163,14 @@ def _ipv4(value, context):
         raise WorkerError('invalid-' + context)
 
 
+def _secrets_names(definition):
+    """Top-level worker-owned entries a secrets-bearing instance dir
+    may carry beyond the declared mount leaves: the provisioned
+    ``secrets/`` dir and its ``.nexus-secrets`` binding marker."""
+    return {_SECRETS_DIR, _SECRETS_MARKER} \
+        if definition['secretSetRef'] is not None else set()
+
+
 def _id_list(value, context):
     if type(value) is not list or len(value) > 64:
         raise WorkerError('invalid-' + context)
@@ -141,8 +186,20 @@ def _store_path(value, context):
 
 
 def validate_config(config):
-    _fields(config, {'schemaVersion', 'hostId', 'architecture', 'stateDir', 'storage',
-                     'capacity', 'capabilities', 'approvedBundles', 'slots'}, 'config')
+    _fields({key: value for key, value in config.items()
+             if key not in _CONFIG_SECRETS},
+            {'schemaVersion', 'hostId', 'architecture', 'stateDir',
+             'storage', 'capacity', 'capabilities', 'approvedBundles',
+             'slots'}, 'config')
+    # The secrets trio is all-or-none: a program without its config or
+    # escrow dir can never provision, so partial configuration is a
+    # config error rather than a deferred runtime surprise.
+    present = [key for key in _CONFIG_SECRETS if key in config]
+    if present and len(present) != len(_CONFIG_SECRETS):
+        raise WorkerError('invalid-config-secrets')
+    for key in _CONFIG_SECRETS:
+        if key in config:
+            _path(config[key], 'config-' + key)
     _integer(config['schemaVersion'], 1, 1, 'config-schemaVersion')
     _identifier(config['hostId'], 'config-hostId')
     if config['architecture'] not in ('x86_64-linux', 'aarch64-linux') \
@@ -203,6 +260,121 @@ class Runner:
         return subprocess.run(argv, capture_output=True, text=True, timeout=300)
 
 
+class SecretsCliRunner:
+    """Bounded runner for the pinned ``nexus-secrets`` executable.
+
+    Fixed shell-free argv, a fixed minimal environment, a new
+    session/process group, a monotonic deadline, byte caps on both
+    output streams and a whole-group kill on any breach — the same
+    discipline as the reporter's CLI runner — with the small request
+    document fed on stdin. The response document carries only binding
+    digests, never secret material; every transport failure raises the
+    caller's uniform code.
+    """
+
+    def __init__(self, env=None):
+        # Explicit minimal environment: no inherited PATH tricks,
+        # locale overrides or secret-bearing variables reach the child.
+        self.env = {'PATH': os.environ.get('PATH', os.defpath),
+                    'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'} \
+            if env is None else dict(env)
+
+    def _reap(self, proc):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def run(self, argv, data=b'', *, timeout=_SECRETS_CLI_TIMEOUT,
+            max_out=_SECRETS_CLI_MAX_OUTPUT):
+        """Bounded nexus-secrets spawn. Returns a CompletedProcess with
+        bytes streams; raises ``WorkerError('secrets-provision-failed')``
+        for any transport breach — argv/timeout/env problems look
+        identical to a failed child, never silently retried."""
+        try:
+            proc = subprocess.Popen(argv, shell=False, env=self.env,
+                                    stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    start_new_session=True)
+        except OSError:
+            raise WorkerError('secrets-provision-failed') from None
+        deadline = time.monotonic() + timeout
+        completed = None
+        selector = None
+        try:
+            try:
+                proc.stdin.write(data)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                raise WorkerError('secrets-provision-failed') from None
+            finally:
+                proc.stdin = None
+            selector = selectors.DefaultSelector()
+            selector.register(proc.stdout, selectors.EVENT_READ,
+                              ('out', bytearray(), max_out))
+            selector.register(proc.stderr, selectors.EVENT_READ,
+                              ('err', bytearray(), max_out))
+            streams = {}
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkerError('secrets-provision-failed')
+                for key, _ in selector.select(min(remaining, 1.0)):
+                    which, buffer, cap = key.data
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                    except OSError:
+                        raise WorkerError(
+                            'secrets-provision-failed') from None
+                    buffer += chunk
+                    if len(buffer) > cap:
+                        raise WorkerError('secrets-provision-failed')
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    streams[which] = buffer
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkerError('secrets-provision-failed')
+                try:
+                    code = proc.wait(timeout=min(remaining, 1.0))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            completed = subprocess.CompletedProcess(
+                argv, code, bytes(streams.get('out', b'')),
+                bytes(streams.get('err', b'')))
+            return completed
+        except OSError:
+            raise WorkerError('secrets-provision-failed') from None
+        finally:
+            if selector is not None:
+                try:
+                    selector.close()
+                except OSError:
+                    pass
+            if completed is None:
+                self._reap(proc)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+
+
 class HostFilesystem:
     def lstat(self, path):
         return os.lstat(path)
@@ -260,6 +432,12 @@ class HostFilesystem:
 
     def chown(self, path, uid, gid):
         os.chown(path, uid, gid, follow_symlinks=False)
+
+    def unlink(self, path):
+        os.unlink(path)
+
+    def rmdir(self, path):
+        os.rmdir(path)
 
     def exists(self, path):
         return os.path.exists(path)
@@ -550,9 +728,11 @@ class SecurePaths:
 
 class Worker(SecurePaths):
     def __init__(self, config, *, runner=None, fs=None, clock=None, boot_id=None,
-                 unit_dir='/run/systemd/system'):
+                 unit_dir='/run/systemd/system', secrets_runner=None):
         self.config = validate_config(config)
         self.runner = runner or Runner()
+        self.secrets_runner = secrets_runner \
+            if secrets_runner is not None else SecretsCliRunner()
         self.fs = fs or HostFilesystem()
         self.clock = clock or Clock()
         self.boot_id = boot_id if boot_id is not None else _host_boot_id()
@@ -728,10 +908,305 @@ class Worker(SecurePaths):
             raise WorkerError('workload-not-mutable')
         if needed not in definition['allowedOperations']:
             raise WorkerError('operation-not-allowed')
-        if definition['secretSetRef'] is not None:
-            raise WorkerError('secret-provisioning-unavailable')
         if definition['dependencies']:
             raise WorkerError('dependency-readiness-unavailable')
+
+    # -- secret provisioning ------------------------------------------------
+
+    def _secrets_ready(self):
+        return all(key in self.config for key in _CONFIG_SECRETS)
+
+    def _require_secrets_gate(self, definition):
+        """A secrets-bearing definition is unusable without the full
+        program/config/bundleDir trio — the same reject the old
+        unconditional check produced, now gated on configuration."""
+        if definition['secretSetRef'] is not None \
+                and not self._secrets_ready():
+            raise WorkerError('secret-provisioning-unavailable')
+
+    def _secrets_names(self, definition):
+        return _secrets_names(definition)
+
+    def _check_secret_extra(self, name, path, slot, *, code,
+                            strict_owner):
+        """Shape rules for the worker's own secrets entries inside an
+        instance dir: ``secrets/`` is an exactly-0700 non-symlink dir,
+        ``.nexus-secrets`` a root-owned exactly-0600 regular file. With
+        ``strict_owner`` (post-prepare invariants) the dir must be
+        slot-owned; adopt/resume also accept root ownership — either a
+        replica's original or a mid-provision residue."""
+        st = self._lstat(path)
+        if name == _SECRETS_DIR:
+            uid_base = slot['uidBase']
+            owners = {(uid_base, uid_base)} if strict_owner \
+                else {(0, 0), (uid_base, uid_base)}
+            if st is None or not stat.S_ISDIR(st.st_mode) \
+                    or stat.S_ISLNK(st.st_mode) \
+                    or stat.S_IMODE(st.st_mode) != 0o700 \
+                    or (st.st_uid, st.st_gid) not in owners:
+                raise WorkerError(code)
+            return
+        if st is None or not stat.S_ISREG(st.st_mode) \
+                or stat.S_ISLNK(st.st_mode) or st.st_uid != 0 \
+                or stat.S_IMODE(st.st_mode) != 0o600:
+            raise WorkerError(code)
+
+    def _load_secret_record(self, secret_set_ref):
+        """Read and validate the host escrow record for a secret set.
+
+        The store layout is ``<secretsBundleDir>/<ref>.json`` (escrow
+        record: the returned seal envelope plus an optional pinned
+        manifest binding) and ``<secretsBundleDir>/<ref>.blob`` (the
+        sealed bytes ``nexus-secrets seal`` wrote) — both populated
+        out-of-band by the controller/operator, both root-owned and
+        never group/other writable, inside an exactly-0700 root dir.
+        Returns ``(envelope, pinned, binding)`` where ``binding`` is the
+        envelope's own manifest triple used for the marker."""
+        bundle_dir = self.config['secretsBundleDir']
+        self._check_dir(bundle_dir, mode=0o700)
+        record_path = os.path.join(bundle_dir, secret_set_ref + '.json')
+        blob_path = os.path.join(bundle_dir, secret_set_ref + '.blob')
+        for path in (record_path, blob_path):
+            st = self._lstat(path)
+            if st is None:
+                raise WorkerError('secrets-bundle-missing')
+            if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) \
+                    or st.st_uid != 0 or stat.S_IMODE(st.st_mode) & 0o022:
+                raise WorkerError('path-unsafe')
+        try:
+            raw = self.fs.read_bounded(record_path, _SECRET_RECORD_MAX)
+        except OSError:
+            raise WorkerError('path-unavailable') from None
+        if len(raw) > _SECRET_RECORD_MAX:
+            raise WorkerError('secrets-bundle-invalid')
+        try:
+            record = load_json_bytes(raw)
+            if type(record) is not dict \
+                    or set(record) != _SECRET_RECORD_FIELDS \
+                    or type(record['schemaVersion']) is not int \
+                    or record['schemaVersion'] != 1:
+                raise WorkerError('secrets-bundle-invalid')
+            envelope = record['envelope']
+            if type(envelope) is not dict \
+                    or envelope.get('secretSetRef') != secret_set_ref:
+                raise WorkerError('secrets-bundle-invalid')
+            binding = {'secretSetRef': secret_set_ref}
+            for key in ('versionDigest', 'bundleDigest'):
+                _digest(envelope.get(key), 'secrets-bundle')
+                binding[key] = envelope[key]
+            pinned = record['binding']
+            if pinned is not None:
+                if type(pinned) is not dict \
+                        or set(pinned) != _SECRET_BINDING_FIELDS \
+                        or pinned['secretSetRef'] != secret_set_ref:
+                    raise WorkerError('secrets-bundle-invalid')
+                _digest(pinned['versionDigest'], 'secrets-bundle')
+                _digest(pinned['bundleDigest'], 'secrets-bundle')
+        except WorkerError as error:
+            if error.code == 'secrets-bundle-invalid':
+                raise
+            raise WorkerError('secrets-bundle-invalid') from None
+        return envelope, pinned, binding
+
+    def _run_secrets_cli(self, secret_set_ref, envelope, binding,
+                         target_dir):
+        """One bounded ``nexus-secrets provision`` call. The sealed
+        blob path and the escrowed envelope plus the optional pinned
+        manifest binding go on stdin; the response's own digests must
+        echo the envelope exactly — anything else is a transport
+        failure, never a partial accept. Typed CLI blocks are surfaced
+        as ``secrets-<code>``; opaque failures are uniform."""
+        request = {'schemaVersion': 1, 'action': 'provision',
+                   'envelope': envelope,
+                   'bundleFile': os.path.join(
+                       self.config['secretsBundleDir'],
+                       secret_set_ref + '.blob'),
+                   'targetDir': target_dir, 'binding': binding}
+        result = self.secrets_runner.run(
+            [self.config['secretsProgram'], '--config',
+             self.config['secretsConfigFile'], 'provision'],
+            artifacts.canonical_bytes(request))
+        try:
+            body = load_json_bytes(result.stdout)
+        except WorkerError:
+            raise WorkerError('secrets-provision-failed') from None
+        if type(body) is not dict or type(body.get('status')) is not str:
+            raise WorkerError('secrets-provision-failed')
+        if body['status'] == 'blocked':
+            error = body.get('error')
+            if type(error) is str \
+                    and _IDENTIFIER_RE.fullmatch(error) is not None:
+                raise WorkerError('secrets-' + error)
+            raise WorkerError('secrets-provision-failed')
+        if result.returncode != 0 or body['status'] != 'completed' \
+                or body.get('action') != 'provision' \
+                or body.get('secretSetRef') != secret_set_ref \
+                or body.get('versionDigest') != envelope['versionDigest'] \
+                or body.get('bundleDigest') != envelope['bundleDigest'] \
+                or type(body.get('fileCount')) is not int \
+                or body['fileCount'] < 1:
+            raise WorkerError('secrets-provision-failed')
+
+    def _wipe_secrets_dir(self, secrets_dir):
+        """Remove a provision-partial ``secrets/`` dir — only ever flat
+        regular files, never silently a foreign tree — and the dir."""
+        for name in self.fs.listdir(secrets_dir):
+            path = os.path.join(secrets_dir, name)
+            entry = self._lstat(path)
+            if entry is None or not stat.S_ISREG(entry.st_mode) \
+                    or stat.S_ISLNK(entry.st_mode):
+                raise WorkerError('storage-state-conflict')
+            self.fs.unlink(path)
+        self.fs.rmdir(secrets_dir)
+
+    def _provision_secrets(self, rec, definition, slot):
+        """Unseal the escrowed bundle into ``<instanceDir>/secrets``.
+
+        Idempotent boundary inside 'preparing': the instance row is
+        already journaled, so a crash anywhere here replays. The
+        ``.nexus-secrets`` marker (canonical binding triple, root 0600)
+        lands only after the provisioned tree is durable and slot-owned
+        — a marker matching the pinned escrow record means "done",
+        anything else means the last attempt never completed and is
+        torn down before a fresh provision. A populated dir without a
+        valid marker is never trusted as secret material."""
+        if definition['secretSetRef'] is None:
+            return
+        ref = definition['secretSetRef']
+        if _SECRETS_DIR in {mount['id'] for mount
+                            in definition['stateMounts']}:
+            raise WorkerError('storage-state-conflict')
+        instance_dir = self._instance_dir(rec)
+        secrets_dir = os.path.join(instance_dir, _SECRETS_DIR)
+        marker_path = os.path.join(instance_dir, _SECRETS_MARKER)
+        uid_base = slot['uidBase']
+        envelope, pinned, binding = self._load_secret_record(ref)
+        expected = artifacts.canonical_bytes(binding)
+        mst = self._lstat(marker_path)
+        matched = False
+        if mst is not None:
+            if not stat.S_ISREG(mst.st_mode) or mst.st_uid != 0 \
+                    or stat.S_IMODE(mst.st_mode) != 0o600:
+                raise WorkerError('storage-state-conflict')
+            try:
+                matched = self.fs.read_bounded(
+                    marker_path, _SECRET_MARKER_MAX) == expected
+            except OSError:
+                raise WorkerError('path-unavailable') from None
+        dst = self._lstat(secrets_dir)
+        if matched:
+            # Resume path: the marker proves this dir was fully
+            # provisioned from this exact envelope, but the tree itself
+            # is re-verified — a marker without its slot-owned payload
+            # is a conflict, never a silent skip.
+            if dst is None or not stat.S_ISDIR(dst.st_mode) \
+                    or stat.S_ISLNK(dst.st_mode) \
+                    or stat.S_IMODE(dst.st_mode) != 0o700 \
+                    or (dst.st_uid, dst.st_gid) != (uid_base, uid_base):
+                raise WorkerError('storage-state-conflict')
+            try:
+                names = self.fs.listdir(secrets_dir)
+            except OSError:
+                raise WorkerError('path-unavailable') from None
+            if not names:
+                raise WorkerError('storage-state-conflict')
+            for name in names:
+                st = self._lstat(os.path.join(secrets_dir, name))
+                if st is None or not stat.S_ISREG(st.st_mode) \
+                        or stat.S_ISLNK(st.st_mode) \
+                        or (st.st_uid, st.st_gid) != (uid_base, uid_base):
+                    raise WorkerError('storage-state-conflict')
+            return
+        if rec['adopted']:
+            # An adopted row may only ever reuse the replicated pair:
+            # the marker is bound to exactly the escrowed envelope
+            # ``_adopt_secrets`` validated before the row was journaled,
+            # so a missing or mismatched pair on replay is a conflict —
+            # never a reprovision over replicated state.
+            raise WorkerError('adopt-state-conflict')
+        if dst is not None:
+            if not stat.S_ISDIR(dst.st_mode) \
+                    or stat.S_ISLNK(dst.st_mode) \
+                    or stat.S_IMODE(dst.st_mode) != 0o700 \
+                    or (dst.st_uid, dst.st_gid) not in (
+                        (0, 0), (uid_base, uid_base)):
+                raise WorkerError('storage-state-conflict')
+            self._wipe_secrets_dir(secrets_dir)
+            self.fs.sync_dir(instance_dir)
+        if mst is not None:
+            self.fs.unlink(marker_path)
+            self.fs.sync_dir(instance_dir)
+        self._run_secrets_cli(ref, envelope, pinned, secrets_dir)
+        dst = self._lstat(secrets_dir)
+        if dst is None or not stat.S_ISDIR(dst.st_mode) \
+                or stat.S_ISLNK(dst.st_mode) \
+                or stat.S_IMODE(dst.st_mode) != 0o700 or dst.st_uid != 0:
+            raise WorkerError('secrets-provision-failed')
+        try:
+            names = self.fs.listdir(secrets_dir)
+        except OSError:
+            raise WorkerError('path-unavailable') from None
+        if not names:
+            raise WorkerError('secrets-provision-failed')
+        for name in names:
+            path = os.path.join(secrets_dir, name)
+            st = self._lstat(path)
+            if st is None or not stat.S_ISREG(st.st_mode) \
+                    or stat.S_ISLNK(st.st_mode) or st.st_uid != 0:
+                raise WorkerError('secrets-provision-failed')
+            self.fs.chown(path, uid_base, uid_base)
+        self.fs.chown(secrets_dir, uid_base, uid_base)
+        self.fs.sync_dir(secrets_dir)
+        self.fs.write_file(marker_path, expected, 0o600)
+        self.fs.sync_dir(instance_dir)
+        self.fs.sync_dir(rec['binding']['storage']['root'])
+
+    def _adopt_secrets(self, instance_dir, definition, slot):
+        """Content validation for replicated secrets entries before an
+        adopt is journaled. ``secrets/`` lives inside the replicated
+        instance dir by design — a secrets-bearing definition's replica
+        must carry the provisioned pair: absent means the replication
+        set is incomplete (``adopt-secrets-missing``), and anything
+        less than a slot-owned dir plus a marker bound to exactly the
+        escrowed envelope this host pins is ``adopt-state-conflict``.
+        Adoption never reprovisions over foreign or missing secret
+        material; a rejected replica leaves no journal row."""
+        if definition['secretSetRef'] is None:
+            return
+        secrets_dir = os.path.join(instance_dir, _SECRETS_DIR)
+        marker_path = os.path.join(instance_dir, _SECRETS_MARKER)
+        dst = self._lstat(secrets_dir)
+        mst = self._lstat(marker_path)
+        if dst is None or mst is None:
+            raise WorkerError('adopt-secrets-missing')
+        self._check_secret_extra(_SECRETS_DIR, secrets_dir, slot,
+                                 code='adopt-state-conflict',
+                                 strict_owner=True)
+        self._check_secret_extra(_SECRETS_MARKER, marker_path, slot,
+                                 code='adopt-state-conflict',
+                                 strict_owner=True)
+        try:
+            names = self.fs.listdir(secrets_dir)
+        except OSError:
+            raise WorkerError('path-unavailable') from None
+        if not names:
+            raise WorkerError('adopt-state-conflict')
+        for name in names:
+            st = self._lstat(os.path.join(secrets_dir, name))
+            uid_base = slot['uidBase']
+            if st is None or not stat.S_ISREG(st.st_mode) \
+                    or stat.S_ISLNK(st.st_mode) \
+                    or (st.st_uid, st.st_gid) != (uid_base, uid_base):
+                raise WorkerError('adopt-state-conflict')
+        _envelope, _pinned, binding = self._load_secret_record(
+            definition['secretSetRef'])
+        try:
+            marker = self.fs.read_bounded(marker_path,
+                                          _SECRET_MARKER_MAX)
+        except OSError:
+            raise WorkerError('path-unavailable') from None
+        if marker != artifacts.canonical_bytes(binding):
+            raise WorkerError('adopt-state-conflict')
 
     def _instance_dir(self, rec):
         binding = rec.get('binding')
@@ -806,8 +1281,13 @@ class Worker(SecurePaths):
             if not resume:
                 raise WorkerError('storage-state-conflict')
             self._check_dir(instance_dir, mode=0o700)
-            if not set(self.fs.listdir(instance_dir)) <= leaf_ids:
+            names = set(self.fs.listdir(instance_dir))
+            if not names <= leaf_ids | self._secrets_names(definition):
                 raise WorkerError('storage-state-conflict')
+            for name in names - leaf_ids:
+                self._check_secret_extra(
+                    name, os.path.join(instance_dir, name), slot,
+                    code='storage-state-conflict', strict_owner=False)
         for mount in definition['stateMounts']:
             leaf = os.path.join(instance_dir, mount['id'])
             st = self._lstat(leaf)
@@ -831,7 +1311,8 @@ class Worker(SecurePaths):
         instance_dir = self._instance_dir(rec)
         self._check_dir(instance_dir, mode=0o700)
         leaf_ids = {mount['id'] for mount in definition['stateMounts']}
-        if set(self.fs.listdir(instance_dir)) != leaf_ids:
+        extras = self._secrets_names(definition)
+        if set(self.fs.listdir(instance_dir)) != leaf_ids | extras:
             raise WorkerError('storage-state-conflict')
         for mount in definition['stateMounts']:
             leaf = os.path.join(instance_dir, mount['id'])
@@ -841,6 +1322,10 @@ class Worker(SecurePaths):
                     or st.st_uid != slot['uidBase'] + mount['ownerUid'] \
                     or st.st_gid != slot['uidBase'] + mount['ownerGid']:
                 raise WorkerError('storage-state-conflict')
+        for name in extras:
+            self._check_secret_extra(
+                name, os.path.join(instance_dir, name), slot,
+                code='storage-state-conflict', strict_owner=True)
 
     def _adopt_dirs(self, instance_dir, definition, slot, claimed):
         """Strictly validate a pre-existing replicated instance dir for
@@ -864,9 +1349,12 @@ class Worker(SecurePaths):
           requires later (``uidBase:uidBase`` for the common
           zero-offset mounts);
         - nothing else at the top level except the worker's own files
-          (restore sentinel, restore staging) which are re-validated and
-          left in place — a replicated sentinel correctly blocks
-          ``start`` with ``restore-incomplete``.
+          (restore sentinel, restore staging, and for secrets-bearing
+          definitions the ``secrets`` dir plus ``.nexus-secrets``
+          marker) which are re-validated and left in place — a
+          replicated sentinel correctly blocks ``start`` with
+          ``restore-incomplete`` and the secrets pair is content-bound
+          to the local escrow by ``_adopt_secrets``.
 
         Rejections are typed and mutate nothing: ``adopt-state-absent``
         (use normal ``prepare``), ``adopt-ownership-conflict`` and
@@ -891,12 +1379,17 @@ class Worker(SecurePaths):
         except OSError:
             raise WorkerError('path-unavailable') from None
         leaf_ids = {mount['id'] for mount in definition['stateMounts']}
+        own_files = _ADOPT_OWN_FILES | self._secrets_names(definition)
         if not leaf_ids <= names \
-                or not names <= leaf_ids | _ADOPT_OWN_FILES:
+                or not names <= leaf_ids | own_files:
             raise WorkerError('adopt-state-conflict')
         for name in names - leaf_ids:
             own = self._lstat(os.path.join(instance_dir, name))
-            if name == _RESTORE_SENTINEL:
+            if name in self._secrets_names(definition):
+                self._check_secret_extra(
+                    name, os.path.join(instance_dir, name), slot,
+                    code='adopt-state-conflict', strict_owner=False)
+            elif name == _RESTORE_SENTINEL:
                 if own is None or not stat.S_ISREG(own.st_mode) \
                         or own.st_uid != 0:
                     raise WorkerError('adopt-state-conflict')
@@ -920,6 +1413,13 @@ class Worker(SecurePaths):
         for mount in definition['stateMounts']:
             leaf = os.path.join(instance_dir, mount['id'])
             binds.append('--bind={}:{}'.format(leaf, mount['mountPoint']))
+        if definition['secretSetRef'] is not None:
+            # The provisioned secrets dir rides the same uid mapping as
+            # the state leaves: slot-owned on the host, uidBase-mapped
+            # in the container, read-only and never part of captures.
+            binds.append('--bind-ro={}:{}'.format(
+                os.path.join(instance_dir, _SECRETS_DIR),
+                _SECRETS_MOUNT))
         flags = ['--ephemeral', '--link-journal=no', '--private-users-ownership=auto',
                  '--inaccessible=/nix/var/nix/daemon-socket',
                  '--rlimit=RLIMIT_NPROC=65535:65535'] + binds
@@ -1338,6 +1838,7 @@ class Worker(SecurePaths):
         held = rec['workload_id'] if resume else request['workloadId']
         if self._held_capture(held) is not None:
             raise WorkerError('capture-held')
+        self._require_secrets_gate(definition)
         probe = self._verify_mount()
         self._verify_closure(manifest)
         self._admission(definition,
@@ -1357,6 +1858,7 @@ class Worker(SecurePaths):
                 # storage-state-conflict.
                 self._adopt_dirs(instance_dir, definition, slot,
                                  claimed=False)
+                self._adopt_secrets(instance_dir, definition, slot)
             elif self._lstat(instance_dir) is not None:
                 raise WorkerError('storage-state-conflict')
             machine = _machine_name(request['instanceId'])
@@ -1404,6 +1906,12 @@ class Worker(SecurePaths):
                 self.fs.sync_dir(rec['binding']['storage']['root'])
         else:
             self._allocate_state_dirs(rec, definition, slot, resume)
+        # Secret provisioning rides the same 'preparing' journal
+        # boundary as state-dir allocation: a verified marker means an
+        # already-populated replica dir (adopt) or a completed earlier
+        # attempt is reused verbatim — adopt never reprovisions, and a
+        # provision-partial crash is torn down and redone cleanly.
+        self._provision_secrets(rec, definition, slot)
         self._render_runtime_files(rec, definition, manifest, slot)
         self.db.execute('UPDATE instances SET phase=? WHERE instance_id=?',
                         ('prepared', rec['instance_id']))

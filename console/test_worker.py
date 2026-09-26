@@ -18,7 +18,10 @@ CONSOLE = Path(__file__).resolve().parent
 sys.path.insert(0, str(CONSOLE))
 import artifacts
 import catalog
+import secrets
 import worker
+from test_repository import make_private_dir, write_private_file
+from test_secrets import ToySealer, KEY
 
 
 def store_path(name, marker):
@@ -337,7 +340,7 @@ def tearDownModule():
 
 
 def make_worker(tmp, definition_overrides=None, runner=None, fs=None, clock=None,
-                bundle_manifest=None, config=None):
+                bundle_manifest=None, config=None, secrets_runner=None):
     config = config or make_config(tmp)[0]
     bundle = os.path.join(tmp, 'bundle')
     manifest = bundle_manifest or manifest_fixture()
@@ -358,7 +361,8 @@ def make_worker(tmp, definition_overrides=None, runner=None, fs=None, clock=None
     os.makedirs(os.path.join(tmp, 'units'), exist_ok=True)
     instance = new_worker(config, runner=runner, fs=fs, clock=clock,
                              boot_id='test-boot-id',
-                             unit_dir=os.path.join(tmp, 'units'))
+                             unit_dir=os.path.join(tmp, 'units'),
+                             secrets_runner=secrets_runner)
     runner.owner = instance
     return instance, runner, fs, clock, definition, manifest
 
@@ -2785,7 +2789,6 @@ class CaptureBarrierTests(unittest.TestCase):
              'operation-not-allowed'),
             ({'allowedOperations': ['start', 'backup']},
              'operation-not-allowed'),
-            ({'secretSetRef': 'sec'}, 'secret-provisioning-unavailable'),
             ({'dependencies': ['other']},
              'dependency-readiness-unavailable'),
         ):
@@ -3242,6 +3245,462 @@ class AdoptTests(unittest.TestCase):
             result = instance.execute(request('start', op='bb' * 16,
                                               revisionDigest=digest))
             self.assertEqual(result['appliedPhase'], 'running')
+
+
+class FakeSecretsRunner:
+    """``SecretsCliRunner`` seam: drives the real ``SecretsService``
+    in-process behind the stub ``ToySealer``, so the provision path
+    (envelope validation, blob-digest verification, binding check,
+    unseal, private-target rules) is production code — only the
+    subprocess transport and the cipher primitive are faked."""
+
+    def __init__(self, key_file):
+        self.service = secrets.SecretsService(
+            {'schemaVersion': 1, 'keyFile': key_file},
+            sealer=ToySealer())
+        self.calls = []
+        self.crash_after = False
+        self.raise_error = None
+
+    def run(self, argv, data=b'', **kwargs):
+        self.calls.append((list(argv), data))
+        if self.raise_error is not None:
+            raise worker.WorkerError(self.raise_error)
+        request = worker.load_json_bytes(data)
+        body = self.service.execute(request)
+        if self.crash_after and body['status'] == 'completed':
+            raise KeyboardInterrupt('simulated crash after provision')
+        return subprocess.CompletedProcess(
+            argv, 0 if body['status'] == 'completed' else 1,
+            json.dumps(body).encode(), b'')
+
+
+def make_secrets_store(tmp, ref='ops-secrets', files=None, binding=None):
+    """Lay out the host escrow contract: ``<bundleDir>/<ref>.json``
+    (envelope record plus optional pinned manifest binding) and
+    ``<bundleDir>/<ref>.blob`` (the sealed bytes), both root-modeled
+    0600 inside a 0700 dir, alongside the sealer key the in-process
+    service unlocks with."""
+    private = make_private_dir(tmp, 'secrets-private')
+    key_path = write_private_file(
+        os.path.join(private, 'identity'), KEY)
+    source = make_private_dir(tmp, 'secrets-source')
+    for name, data in (files or {'app.env': b'A=1\n',
+                                 'db-password': b's3cr3t'}).items():
+        write_private_file(os.path.join(source, name), data)
+    blob, envelope = secrets.seal(source, ref, key=KEY,
+                                  sealer=ToySealer())
+    bundle_dir = make_private_dir(tmp, 'secrets-bundles')
+    write_private_file(os.path.join(bundle_dir, ref + '.blob'), blob)
+    record = {'schemaVersion': 1, 'envelope': envelope,
+              'binding': binding}
+    write_private_file(os.path.join(bundle_dir, ref + '.json'),
+                       artifacts.canonical_bytes(record))
+    return bundle_dir, envelope, key_path
+
+
+def make_secrets_worker(tmp, ref='ops-secrets', binding=None,
+                        definition_overrides=None, **kwargs):
+    """A worker configured for provisioning: escrow store laid out,
+    the all-or-none config trio wired, a ``FakeSecretsRunner`` seam and
+    a definition carrying ``secretSetRef``."""
+    bundle_dir, envelope, key_path = make_secrets_store(
+        tmp, ref=ref, binding=binding)
+    config, _ = make_config(tmp)
+    config_file = write_private_file(
+        os.path.join(tmp, 'secrets-private', 'config.json'),
+        artifacts.canonical_bytes(
+            {'schemaVersion': 1, 'keyFile': key_path}))
+    config.update({
+        'secretsProgram': os.path.join(tmp, 'bin', 'nexus-secrets'),
+        'secretsConfigFile': config_file,
+        'secretsBundleDir': bundle_dir})
+    overrides = dict(definition_overrides or {})
+    overrides.setdefault('secretSetRef', ref)
+    fake = FakeSecretsRunner(key_path)
+    instance, runner, fs, clock, definition, manifest = make_worker(
+        tmp, definition_overrides=overrides, config=config,
+        secrets_runner=fake, **kwargs)
+    return instance, runner, fs, clock, definition, fake, envelope
+
+
+def secrets_marker(envelope, ref='ops-secrets'):
+    return artifacts.canonical_bytes(
+        {'secretSetRef': ref,
+         'versionDigest': envelope['versionDigest'],
+         'bundleDigest': envelope['bundleDigest']})
+
+
+class SecretsProvisionTests(unittest.TestCase):
+    """Host-escrowed secret provisioning in the worker lifecycle:
+    ``secrets/`` is unsealed per instance during prepare, bound by the
+    escrow record, chowned to the slot uidBase, mounted read-only at
+    ``/run/secrets``, and provenance-journaled by the ``.nexus-secrets``
+    marker so crash replays converge instead of double-provisioning."""
+
+    def _secrets_replica(self, storage_root, fs, envelope,
+                         instance='0a' * 16, uid_base=65536,
+                         files=('app.env',), marker_body=None):
+        """A uidBase-owned replica carrying the provisioned pair
+        exactly as a failover peer's prepare would have left it."""
+        idir = os.path.join(storage_root, instance)
+        os.mkdir(idir, 0o700)
+        fs.owners[idir] = (uid_base, uid_base)
+        leaf = os.path.join(idir, 'data')
+        os.mkdir(leaf, 0o700)
+        fs.owners[leaf] = (uid_base, uid_base)
+        sdir = os.path.join(idir, worker._SECRETS_DIR)
+        os.mkdir(sdir, 0o700)
+        fs.owners[sdir] = (uid_base, uid_base)
+        for name in files:
+            path = os.path.join(sdir, name)
+            Path(path).write_bytes(b'sec')
+            os.chmod(path, 0o600)
+            fs.owners[path] = (uid_base, uid_base)
+        body = marker_body if marker_body is not None else json.loads(
+            secrets_marker(envelope))
+        marker_path = os.path.join(idir, worker._SECRETS_MARKER)
+        Path(marker_path).write_bytes(artifacts.canonical_bytes(body))
+        os.chmod(marker_path, 0o600)
+        return idir
+
+    def test_prepare_provisions_and_binds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(tmp)
+            digest = definition['revisionDigest']
+            result = instance.execute(
+                request('prepare', revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            idir = os.path.join(instance.config['storage']['root'],
+                                '0a' * 16)
+            sdir = os.path.join(idir, worker._SECRETS_DIR)
+            self.assertEqual(len(fake.calls), 1)
+            argv, data = fake.calls[0]
+            self.assertEqual(
+                argv, [instance.config['secretsProgram'], '--config',
+                       instance.config['secretsConfigFile'],
+                       'provision'])
+            req = json.loads(data)
+            self.assertEqual(req['action'], 'provision')
+            self.assertEqual(req['envelope'], envelope)
+            self.assertEqual(req['targetDir'], sdir)
+            self.assertEqual(req['bundleFile'], os.path.join(
+                instance.config['secretsBundleDir'],
+                'ops-secrets.blob'))
+            self.assertIsNone(req['binding'])
+            # Provisioned files are slot-owned; the durable marker
+            # carries the canonical manifest binding triple.
+            self.assertEqual(
+                Path(sdir, 'db-password').read_bytes(), b's3cr3t')
+            self.assertIn((sdir, 65536, 65536), fs.chowns)
+            self.assertIn((os.path.join(sdir, 'db-password'),
+                           65536, 65536), fs.chowns)
+            marker = Path(idir, worker._SECRETS_MARKER)
+            self.assertEqual(marker.read_bytes(),
+                             secrets_marker(envelope))
+            self.assertEqual(
+                stat.S_IMODE(marker.stat().st_mode), 0o600)
+            # The runtime contract: read-only /run/secrets bind.
+            machine = worker._machine_name('0a' * 16)
+            env = Path(tmp, 'worker-state', 'instances', machine,
+                       'nspawn.env').read_text()
+            self.assertIn(
+                '--bind-ro={}:/run/secrets'.format(sdir), env)
+            # Start revalidates the full instance layout.
+            result = instance.execute(request(
+                'start', op='bb' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'running')
+
+    def test_prepare_gate_requires_trio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # No secrets config at all: same unconditional reject as
+            # before provisioning existed.
+            instance, *_ , definition, _ = make_worker(
+                tmp, definition_overrides={'secretSetRef': 'ops'})
+            result = instance.execute(request(
+                'prepare',
+                revisionDigest=definition['revisionDigest']))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'],
+                             'secret-provisioning-unavailable')
+
+    def test_config_trio_all_or_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, _ = make_config(tmp)
+            trio = {'secretsProgram': '/x/prog',
+                    'secretsConfigFile': '/x/conf',
+                    'secretsBundleDir': '/x/bundles'}
+            cfg = dict(base)
+            cfg.update(trio)
+            self.assertIsNotNone(worker.validate_config(cfg))
+            for drop in trio:
+                cfg = dict(base)
+                cfg.update({key: value for key, value in trio.items()
+                            if key != drop})
+                with self.assertRaises(worker.WorkerError,
+                                       msg=drop):
+                    worker.validate_config(cfg)
+            for key, value in (('secretsProgram', 'rel'),
+                               ('secretsConfigFile', 'rel'),
+                               ('secretsBundleDir', 'rel'),
+                               ('secretsBundleDir', '/bad path')):
+                cfg = dict(base)
+                cfg.update(trio)
+                cfg[key] = value
+                with self.assertRaises(worker.WorkerError, msg=key):
+                    worker.validate_config(cfg)
+
+    def test_bundle_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(tmp)
+            os.unlink(os.path.join(
+                instance.config['secretsBundleDir'],
+                'ops-secrets.json'))
+            result = instance.execute(request(
+                'prepare',
+                revisionDigest=definition['revisionDigest']))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'secrets-bundle-missing')
+
+    def test_bundle_record_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(tmp)
+            record_path = os.path.join(
+                instance.config['secretsBundleDir'],
+                'ops-secrets.json')
+            bad = {'schemaVersion': 1,
+                   'envelope': dict(envelope, secretSetRef='other'),
+                   'binding': None}
+            Path(record_path).write_bytes(
+                artifacts.canonical_bytes(bad))
+            result = instance.execute(request(
+                'prepare',
+                revisionDigest=definition['revisionDigest']))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'],
+                             'secrets-bundle-invalid')
+
+    def test_binding_pinned_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The escrow record pins a manifest binding that does not
+            # match its own envelope — the CLI rejects it and the typed
+            # code passes through.
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(
+                    tmp, binding={'secretSetRef': 'ops-secrets',
+                                  'versionDigest': 'sha256:' + '0' * 64,
+                                  'bundleDigest': 'sha256:' + '1' * 64})
+            result = instance.execute(request(
+                'prepare',
+                revisionDigest=definition['revisionDigest']))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'],
+                             'secrets-bundle-binding-mismatch')
+
+    def test_binding_pinned_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(
+                    tmp,
+                    binding={'secretSetRef': 'ops-secrets',
+                             'versionDigest': 'sha256:' + '0' * 64,
+                             'bundleDigest': 'sha256:' + '1' * 64})
+            # Repin the record to the envelope's own triple.
+            record_path = os.path.join(
+                instance.config['secretsBundleDir'],
+                'ops-secrets.json')
+            record = {'schemaVersion': 1, 'envelope': envelope,
+                      'binding': {'secretSetRef': 'ops-secrets',
+                                  'versionDigest':
+                                  envelope['versionDigest'],
+                                  'bundleDigest':
+                                  envelope['bundleDigest']}}
+            Path(record_path).write_bytes(
+                artifacts.canonical_bytes(record))
+            result = instance.execute(request(
+                'prepare',
+                revisionDigest=definition['revisionDigest']))
+            self.assertEqual(result['status'], 'completed', result)
+            argv, data = fake.calls[0]
+            self.assertEqual(json.loads(data)['binding'],
+                             record['binding'])
+
+    def test_provision_transport_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(tmp)
+            fake.raise_error = 'secrets-provision-failed'
+            result = instance.execute(request(
+                'prepare',
+                revisionDigest=definition['revisionDigest']))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'],
+                             'secrets-provision-failed')
+
+    def test_resume_after_provision_crash_reprovisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(tmp)
+            digest = definition['revisionDigest']
+            req = request('prepare', revisionDigest=digest)
+            fake.crash_after = True
+            with self.assertRaises(KeyboardInterrupt):
+                instance.execute(req)
+            # The crash left a populated secrets dir without its
+            # marker — resume wipes and reprovisions, never trusts it.
+            fake.crash_after = False
+            result = instance.execute(req)
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(len(fake.calls), 2)
+            idir = os.path.join(instance.config['storage']['root'],
+                                '0a' * 16)
+            marker = Path(idir, worker._SECRETS_MARKER)
+            self.assertEqual(marker.read_bytes(),
+                             secrets_marker(envelope))
+            self.assertEqual(
+                Path(idir, worker._SECRETS_DIR,
+                     'db-password').read_bytes(), b's3cr3t')
+
+    def test_resume_with_valid_marker_skips_provision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(tmp)
+            digest = definition['revisionDigest']
+            # Journal a 'preparing' row plus a fully provisioned dir —
+            # the post-marker crash shape.
+            insert_instance(instance, digest, phase='preparing')
+            idir = os.path.join(instance.config['storage']['root'],
+                                '0a' * 16)
+            os.mkdir(idir, 0o700)
+            leaf = os.path.join(idir, 'data')
+            os.mkdir(leaf, 0o700)
+            fs.owners[leaf] = (65536, 65536)
+            sdir = os.path.join(idir, worker._SECRETS_DIR)
+            os.mkdir(sdir, 0o700)
+            fs.owners[sdir] = (65536, 65536)
+            path = os.path.join(sdir, 'app.env')
+            Path(path).write_bytes(b'A=1\n')
+            os.chmod(path, 0o600)
+            fs.owners[path] = (65536, 65536)
+            marker_path = os.path.join(idir, worker._SECRETS_MARKER)
+            Path(marker_path).write_bytes(secrets_marker(envelope))
+            os.chmod(marker_path, 0o600)
+            result = instance.execute(
+                request('prepare', revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'prepared')
+            self.assertEqual(fake.calls, [])
+
+    def test_adopt_reuses_replicated_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            idir = self._secrets_replica(storage, fs, envelope)
+            result = instance.execute(
+                request('adopt', revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            # The replicated provisioned pair is reused verbatim —
+            # adopt never re-invokes the provision path.
+            self.assertEqual(fake.calls, [])
+            self.assertIn((idir, 0, 0), fs.chowns)
+            self.assertEqual(
+                Path(idir, worker._SECRETS_MARKER).read_bytes(),
+                secrets_marker(envelope))
+
+    def test_adopt_missing_secrets_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            idir = os.path.join(storage, '0a' * 16)
+            os.mkdir(idir, 0o700)
+            fs.owners[idir] = (65536, 65536)
+            leaf = os.path.join(idir, 'data')
+            os.mkdir(leaf, 0o700)
+            fs.owners[leaf] = (65536, 65536)
+            result = instance.execute(
+                request('adopt', revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'adopt-secrets-missing')
+            self.assertIsNone(instance._get_instance('0a' * 16))
+            self.assertEqual(fake.calls, [])
+
+    def test_adopt_marker_mismatch_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            self._secrets_replica(
+                storage, fs, envelope,
+                marker_body={'secretSetRef': 'ops-secrets',
+                             'versionDigest': 'sha256:' + '9' * 64,
+                             'bundleDigest': 'sha256:' + '8' * 64})
+            result = instance.execute(
+                request('adopt', revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'adopt-state-conflict')
+            self.assertIsNone(instance._get_instance('0a' * 16))
+            self.assertEqual(fake.calls, [])
+
+    def test_adopt_resume_never_reprovisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            # An adopted 'preparing' row whose replicated marker no
+            # longer matches the escrow record (the bundle was re-sealed
+            # after the replica landed): adopt may only reuse the pair
+            # verbatim — wiping and re-seeding replicated secrets is
+            # never allowed, so replay rejects instead.
+            insert_instance(instance, digest, phase='preparing')
+            instance.db.execute(
+                'UPDATE instances SET adopted=1 WHERE instance_id=?',
+                ('0a' * 16,))
+            instance.db.commit()
+            idir = self._secrets_replica(
+                storage, fs, envelope,
+                marker_body={'secretSetRef': 'ops-secrets',
+                             'versionDigest': 'sha256:' + '9' * 64,
+                             'bundleDigest': 'sha256:' + '8' * 64})
+            # The claim already landed — the instance dir is root-owned.
+            fs.owners[idir] = (0, 0)
+            result = instance.execute(request(
+                'adopt', revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'adopt-state-conflict')
+            self.assertEqual(fake.calls, [])
+            self.assertEqual(
+                Path(idir, worker._SECRETS_DIR,
+                     'app.env').read_bytes(), b'sec')
+
+    def test_prepare_without_secrets_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # A configured trio stays inert for definitions without
+            # secretSetRef: no CLI call, no extra entries, no bind.
+            instance, runner, fs, clock, definition, fake, envelope = \
+                make_secrets_worker(
+                    tmp, definition_overrides={'secretSetRef': None})
+            digest = definition['revisionDigest']
+            result = instance.execute(
+                request('prepare', revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(fake.calls, [])
+            idir = os.path.join(instance.config['storage']['root'],
+                                '0a' * 16)
+            self.assertEqual(set(os.listdir(idir)), {'data'})
+            machine = worker._machine_name('0a' * 16)
+            env = Path(tmp, 'worker-state', 'instances', machine,
+                       'nspawn.env').read_text()
+            self.assertNotIn('bind-ro', env)
 
 
 if __name__ == '__main__':

@@ -1,7 +1,7 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.nexus-workload-worker;
-  configJson = pkgs.writeText "nexus-worker-config.json" (builtins.toJSON {
+  configJson = pkgs.writeText "nexus-worker-config.json" (builtins.toJSON ({
     schemaVersion = 1;
     hostId = cfg.hostId;
     architecture = pkgs.stdenv.hostPlatform.system;
@@ -11,7 +11,11 @@ let
     capabilities = cfg.capabilities;
     approvedBundles = cfg.approvedBundles ++ cfg.approvedBundlePaths;
     slots = cfg.slots;
-  });
+  } // lib.optionalAttrs (cfg.secretsProgram != null) {
+    secretsProgram = cfg.secretsProgram;
+    secretsConfigFile = cfg.secretsConfigFile;
+    secretsBundleDir = cfg.secretsBundleDir;
+  }));
   workerLib = pkgs.runCommand "nexus-worker-lib" { } ''
     mkdir $out
     cp ${../console/worker.py} $out/worker.py
@@ -71,6 +75,21 @@ in {
       default = [ ];
       description = "Slot records {id,uidBase,hostAddress,localAddress} bound per workload instance.";
     };
+    secretsProgram = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Pinned nexus-secrets executable used to unseal escrowed bundles into instance dirs; must be set together with secretsConfigFile and secretsBundleDir, and defaults to the nexus-secrets wrapper when services.nexus-workload-secrets is enabled.";
+    };
+    secretsConfigFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Absolute runtime path to the root-owned nexus-secrets configuration JSON passed to secretsProgram as --config; never ingested into the store. Required when secretsProgram is set.";
+    };
+    secretsBundleDir = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Root-owned 0700 host escrow directory holding <secretSetRef>.json envelope records and <secretSetRef>.blob sealed blobs; required when secretsProgram is set.";
+    };
     configFile = lib.mkOption {
       type = lib.types.path;
       internal = true;
@@ -81,13 +100,28 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = (cfg.secretsProgram == null)
+          == (cfg.secretsConfigFile == null)
+          && (cfg.secretsConfigFile == null) == (cfg.secretsBundleDir == null);
+        message = "services.nexus-workload-worker.secretsProgram, secretsConfigFile and secretsBundleDir must be set together or left unset";
+      }
+      {
+        assertion = cfg.secretsProgram == null
+          || (lib.hasPrefix "/" cfg.secretsConfigFile
+              && lib.hasPrefix "/" cfg.secretsBundleDir);
+        message = "services.nexus-workload-worker.secretsConfigFile and secretsBundleDir must be absolute paths";
+      }
+    ];
     boot.enableContainers = true;
     boot.kernelModules = [ "overlay" "tun" ];
     environment.systemPackages = [ workerCli ];
     systemd.tmpfiles.rules = [
       "d ${cfg.stateDir} 0700 root root -"
       "d ${cfg.stateDir}/instances 0700 root root -"
-    ];
+    ] ++ lib.optional (cfg.secretsBundleDir != null)
+      "d ${cfg.secretsBundleDir} 0700 root root -";
     systemd.units."nexus-workload@.service".text = ''
       [Unit]
       Description=Nexus workload instance '%i'

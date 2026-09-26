@@ -353,7 +353,8 @@ def observe_record(**overrides):
     return record
 
 
-def make_manifest(definition=None, **source_overrides):
+def make_manifest(definition=None, secret_bundle=None,
+                  **source_overrides):
     source = {'hostId': 'host-a', 'instanceId': SOURCE_INSTANCE,
               'generation': 1, 'uidBase': SRC_BASE}
     source.update(source_overrides)
@@ -362,7 +363,8 @@ def make_manifest(definition=None, **source_overrides):
         {'adapter': 'quiesce-v1', 'consistency': 'quiesced',
          'startedAt': 1000, 'completedAt': 1010},
         state_tree_digests={'data': 'sha256:' + '2' * 64},
-        state_set_digest='sha256:' + '3' * 64)
+        state_set_digest='sha256:' + '3' * 64,
+        secret_bundle=secret_bundle)
 
 
 class RestoreFixture(unittest.TestCase):
@@ -877,6 +879,94 @@ class StageTests(RestoreFixture):
         leaf = os.path.join(self.instance_dir, 'data')
         self.owners.claim(leaf, SRC_BASE, SRC_BASE)
         self.expect_blocked(self.stage(), 'storage-state-conflict')
+
+    def _secrets_target(self):
+        """Rewire the fixture to a secrets-bearing target: a distinct
+        revision, the provisioned ``secrets/`` dir and the worker's
+        marker inside the prepared instance dir, and a recovery point
+        carrying the bound ``secretBundle`` triple."""
+        secrets_def = catalog.validate_definition(
+            sealed(secretSetRef='lab-secrets'))
+        revision = secrets_def['revisionDigest']
+        bundle = {'secretSetRef': 'lab-secrets',
+                  'versionDigest': 'sha256:' + '5' * 64,
+                  'bundleDigest': 'sha256:' + '6' * 64}
+        manifest = make_manifest(definition=secrets_def,
+                                 secret_bundle=bundle)
+        self.fake_repo.add_point(
+            '7' * 64, manifest, 'sha256:' + '3' * 64,
+            {'data': {'value': b'restored-marker'}})
+        self.fake_worker.definitions[('demo', revision)] = secrets_def
+        self.fake_worker.recs[INSTANCE] = worker_record(
+            self.storage, self.slot, revision_digest=revision)
+        secrets_dir = os.path.join(self.instance_dir,
+                                   worker._SECRETS_DIR)
+        os.mkdir(secrets_dir, 0o700)
+        self.owners.claim(secrets_dir, DST_BASE, DST_BASE)
+        secret = os.path.join(secrets_dir, 'app.env')
+        write_private_file(secret, b'A=1\n')
+        self.owners.claim(secret, DST_BASE, DST_BASE)
+        marker = os.path.join(self.instance_dir,
+                              worker._SECRETS_MARKER)
+        write_private_file(marker, artifacts.canonical_bytes(bundle))
+        return revision
+
+    def _secrets_request(self, revision):
+        target = {'workloadId': 'demo', 'revisionDigest': revision,
+                  'instanceId': INSTANCE, 'generation': 2,
+                  'slotId': 's1'}
+        return stage_request(target=target, snapshotId='7' * 64)
+
+    def test_stage_secrets_bound_marker_accepts(self):
+        revision = self._secrets_target()
+        response = self.make().execute(
+            self._secrets_request(revision))
+        self.assertEqual(response['status'], 'completed', response)
+        self.assertEqual(
+            response['record']['manifest']['secretBundle'],
+            {'secretSetRef': 'lab-secrets',
+             'versionDigest': 'sha256:' + '5' * 64,
+             'bundleDigest': 'sha256:' + '6' * 64})
+        # The provisioned pair survives staging untouched.
+        secrets_dir = os.path.join(self.instance_dir,
+                                   worker._SECRETS_DIR)
+        self.assertTrue(os.path.isdir(secrets_dir))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.instance_dir, worker._SECRETS_MARKER)))
+
+    def test_stage_secrets_marker_manifest_mismatch(self):
+        # The point pins a different bundle than the provisioned
+        # marker — restore refuses rather than run new state against
+        # stale secrets.
+        revision = self._secrets_target()
+        bad = {'secretSetRef': 'lab-secrets',
+               'versionDigest': 'sha256:' + '5' * 64,
+               'bundleDigest': 'sha256:' + '9' * 64}
+        marker = os.path.join(self.instance_dir,
+                              worker._SECRETS_MARKER)
+        write_private_file(marker, artifacts.canonical_bytes(bad))
+        response = self.make().execute(
+            self._secrets_request(revision))
+        self.expect_blocked(response, 'secrets-conflict')
+
+    def test_stage_secrets_missing_pair(self):
+        secrets_def = catalog.validate_definition(
+            sealed(secretSetRef='lab-secrets'))
+        revision = secrets_def['revisionDigest']
+        bundle = {'secretSetRef': 'lab-secrets',
+                  'versionDigest': 'sha256:' + '5' * 64,
+                  'bundleDigest': 'sha256:' + '6' * 64}
+        self.fake_repo.add_point(
+            '7' * 64, make_manifest(definition=secrets_def,
+                                    secret_bundle=bundle),
+            'sha256:' + '3' * 64,
+            {'data': {'value': b'restored-marker'}})
+        self.fake_worker.definitions[('demo', revision)] = secrets_def
+        self.fake_worker.recs[INSTANCE] = worker_record(
+            self.storage, self.slot, revision_digest=revision)
+        response = self.make().execute(
+            self._secrets_request(revision))
+        self.expect_blocked(response, 'storage-state-conflict')
 
     def test_stage_busy(self):
         instance = self.make()
