@@ -195,6 +195,25 @@ class ConfigTests(unittest.TestCase):
         ingress.validate_snapshot(snapshot(nonce, rows=rows), config,
                                   nonce, now=1000.0, highwater=0)
 
+    def test_backend_accepts_dep_having_definition(self):
+        """Dep-having definitions are legitimate ingress backends:
+        cross-host dependency readiness is the control plane's gate —
+        it already ran before the workload could be placed and
+        reported running; routing is not the layer that owns it."""
+        dep_def, _ = test_registry.sealed_fixture(dependencies=['db'])
+        registry_config = test_registry.make_config(definition=dep_def)
+        config = ingress.validate_config(
+            {'schemaVersion': 2, 'registryUrl': 'https://r.test',
+             'registry': registry_config, 'listenPort': 9445,
+             'stateDir': '/x'})
+        backend = dict(BACKEND,
+                       revisionDigest=dep_def['revisionDigest'])
+        rows = [dict(ROUTE, backend=backend)]
+        result = ingress.validate_snapshot(
+            snapshot(test_registry.NONCE, rows=rows), config,
+            test_registry.NONCE, now=1000.0, highwater=0)
+        self.assertEqual(result['routes'][0]['backend'], backend)
+
 
 class IngressTests(unittest.TestCase):
     def test_poll_install_authorize_expire(self):

@@ -664,7 +664,7 @@ class PrepareTests(unittest.TestCase):
     def test_blocked_definitions(self):
         cases = [
             ({'secretSetRef': 'ops-secrets'}, 'secret-provisioning-unavailable'),
-            ({'dependencies': ['db']}, 'dependency-readiness-unavailable'),
+            ({'dependencies': ['db']}, 'dependency-not-resolved'),
             ({'allowedOperations': ['backup']}, 'operation-not-allowed'),
             ({'category': 'infrastructure',
               'allowedOperations': ['backup']}, 'workload-not-mutable'),
@@ -677,6 +677,49 @@ class PrepareTests(unittest.TestCase):
                     'prepare', revisionDigest=definition['revisionDigest']))
                 self.assertEqual(result['status'], 'failed', overrides)
                 self.assertEqual(result['error'], code, overrides)
+
+    def test_dependency_marker_required(self):
+        """A dep-having definition is fail-closed: accepted only with
+        the controller's ``dependenciesResolved: true`` marker — legacy
+        no-marker requests, a false marker and a non-boolean marker all
+        fail; the exact marker admits the lifecycle."""
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(
+                tmp, definition_overrides={'dependencies': ['db']})
+            digest = definition['revisionDigest']
+            # Legacy pre-marker request shape: dep-having defs refuse.
+            result = instance.execute(request(
+                'prepare', revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'dependency-not-resolved')
+            # A JSON false marker is no proof either.
+            result = instance.execute(request(
+                'prepare', op='ab' * 16, revisionDigest=digest,
+                dependenciesResolved=False))
+            self.assertEqual(result['error'], 'dependency-not-resolved')
+            # A non-boolean marker fails strict request validation.
+            with self.assertRaises(worker.WorkerError) as ctx:
+                instance.execute(request(
+                    'prepare', op='ac' * 16, revisionDigest=digest,
+                    dependenciesResolved='yes'))
+            self.assertEqual(ctx.exception.code,
+                             'invalid-request-fields')
+            self.assertIsNone(instance._get_instance('0a' * 16))
+            # The exact controller marker admits every gated action;
+            # the start completing proves the internal permit guard's
+            # no-request check did not re-block deps either.
+            result = instance.execute(request(
+                'prepare', op='ad' * 16, revisionDigest=digest,
+                dependenciesResolved=True))
+            self.assertEqual(result['status'], 'completed', result)
+            result = instance.execute(request(
+                'start', op='ae' * 16, revisionDigest=digest,
+                dependenciesResolved=True))
+            self.assertEqual(result['appliedPhase'], 'running', result)
+            result = instance.execute(request(
+                'stop', op='af' * 16, revisionDigest=digest,
+                dependenciesResolved=True))
+            self.assertEqual(result['appliedPhase'], 'stopped', result)
 
     def test_archive_bundle_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2790,7 +2833,7 @@ class CaptureBarrierTests(unittest.TestCase):
             ({'allowedOperations': ['start', 'backup']},
              'operation-not-allowed'),
             ({'dependencies': ['other']},
-             'dependency-readiness-unavailable'),
+             'dependency-not-resolved'),
         ):
             with tempfile.TemporaryDirectory() as tmp:
                 instance, runner, fs, clock, definition, _ = make_worker(
@@ -2800,6 +2843,27 @@ class CaptureBarrierTests(unittest.TestCase):
                 result = instance.execute(self._freeze(digest))
                 self.assertEqual(result['status'], 'failed')
                 self.assertEqual(result['error'], code, overrides)
+
+    def test_freeze_thaw_with_dependency_marker(self):
+        """Capture actions are gated like every other request: a
+        marked freeze/thaw pair on a dep-having definition runs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(
+                tmp, definition_overrides={'dependencies': ['other']})
+            digest = definition['revisionDigest']
+            marked = {'dependenciesResolved': True}
+            instance.execute(request(
+                'prepare', revisionDigest=digest, **marked))
+            instance.execute(request(
+                'start', op='bb' * 16, revisionDigest=digest, **marked))
+            freeze = self._freeze(digest)
+            freeze['dependenciesResolved'] = True
+            result = instance.execute(freeze)
+            self.assertEqual(result['status'], 'completed', result)
+            thaw = self._thaw(digest, op='f1' * 16)
+            thaw['dependenciesResolved'] = True
+            result = instance.execute(thaw)
+            self.assertEqual(result['status'], 'completed', result)
 
     def test_freeze_requires_prepared_phase_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3126,6 +3190,28 @@ class AdoptTests(unittest.TestCase):
                 self.assertEqual(result['error'], code, scenario)
                 # A rejected adopt journals no instance record.
                 self.assertIsNone(instance._get_instance('0a' * 16))
+
+    def test_adopt_requires_dependency_marker(self):
+        """Failover adopts carry the same controller proof: no marker
+        refuses before the replica dir is even inspected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(
+                tmp, definition_overrides={'dependencies': ['db']})
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            self._replica(storage, fs)
+            result = instance.execute(request(
+                'adopt', revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'dependency-not-resolved')
+            self.assertIsNone(instance._get_instance('0a' * 16))
+            result = instance.execute(request(
+                'adopt', op='ab' * 16, revisionDigest=digest,
+                dependenciesResolved=True))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'prepared')
+            self.assertEqual(
+                instance._get_instance('0a' * 16)['adopted'], 1)
 
     def test_adopt_prepare_still_refuses_existing_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

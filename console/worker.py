@@ -33,6 +33,17 @@ with a DRBD replica, so ``adopt`` requires — and never rewrites — a
 valid marker-bound secrets dir. A secrets-bearing definition without
 the full program/config/bundleDir trio stays rejected with
 ``secret-provisioning-unavailable``.
+
+Dependency readiness is control-plane owned: the worker sees only
+local instances and cannot evaluate cross-host dependencies, so it
+stays fail-closed — a request for a definition with non-empty
+``dependencies`` is accepted only when it carries the
+controller-emitted ``dependenciesResolved`` marker set to the exact
+JSON boolean true (an OPTIONAL member of the strict non-observe
+request field set); anything else fails ``dependency-not-resolved``.
+Internal control-plane-ordered checks (permit guard, restore staging)
+carry no request and do not re-check: the dep gate already ran before
+the controller dispatched that step.
 """
 import argparse
 import base64
@@ -79,6 +90,15 @@ _REQUEST_FIELDS = {'schemaVersion', 'operationId', 'action', 'workloadId',
                    'revisionDigest', 'instanceId', 'generation'}
 _CAPTURE_FIELDS = _REQUEST_FIELDS | {'captureId'}
 _OBSERVE_FIELDS = {'schemaVersion', 'action', 'instanceId'}
+# ``dependenciesResolved`` is the controller's OPTIONAL proof marker on
+# any non-observe request (see ``controller._worker_request``): the
+# worker sees only local instances and cannot evaluate cross-host
+# dependency readiness, so it stays fail-closed — a definition with
+# non-empty ``dependencies`` is admissible only when the request
+# carries this field set to the exact JSON boolean true. Dep-less
+# workloads may omit it entirely; it never appears on observe, whose
+# strict field set is separate.
+_REQUEST_OPTIONAL = {'dependenciesResolved'}
 _RESERVE_PHASES = ('preparing', 'prepared', 'starting', 'running', 'stopping',
                    'unknown')
 _PERMIT_SECONDS = 60
@@ -531,18 +551,25 @@ def load_json_bytes(raw):
 
 
 def validate_request(request):
-    if type(request) is not dict or set(request) not in (
-            _REQUEST_FIELDS, _OBSERVE_FIELDS, _CAPTURE_FIELDS):
+    if type(request) is not dict:
+        raise WorkerError('invalid-request-fields')
+    if 'dependenciesResolved' in request \
+            and type(request['dependenciesResolved']) is not bool:
+        raise WorkerError('invalid-request-fields')
+    fields = set(request) - _REQUEST_OPTIONAL
+    if fields not in (_REQUEST_FIELDS, _OBSERVE_FIELDS, _CAPTURE_FIELDS):
         raise WorkerError('invalid-request-fields')
     _integer(request['schemaVersion'], 1, 1, 'schemaVersion')
-    if set(request) == _OBSERVE_FIELDS:
+    if fields == _OBSERVE_FIELDS:
+        if 'dependenciesResolved' in request:
+            raise WorkerError('invalid-request-fields')
         if request['action'] != 'observe':
             raise WorkerError('invalid-action')
         _hex32(request['instanceId'], 'instanceId')
         return request['action'], request
     expected = _CAPTURE_FIELDS \
         if request['action'] in ('freeze', 'thaw') else _REQUEST_FIELDS
-    if set(request) != expected:
+    if fields != expected:
         raise WorkerError('invalid-request-fields')
     if request['action'] not in ('prepare', 'adopt', 'start', 'stop',
                                  'retire', 'freeze', 'thaw'):
@@ -902,14 +929,29 @@ class Worker(SecurePaths):
         if not decision['eligible']:
             raise WorkerError('admission-' + decision['reasons'][0].split(':')[0])
 
-    def _check_action_allowed(self, definition, action):
+    def _check_action_allowed(self, definition, action, request=None):
+        """Category/allowedOperations gate shared by every action path.
+
+        ``request`` is ``None`` only for internal control-plane-ordered
+        callers — the permit guard and restore staging — which run
+        inside a sequence the controller dispatched after verifying
+        dependencies; there is no request to mark, so the dep gate must
+        not re-block them (mirroring how the secrets gate lives outside
+        this check). A request-bearing call is fail-closed the other
+        way: a definition with non-empty ``dependencies`` is accepted
+        only when the request carries the controller-emitted
+        ``dependenciesResolved`` marker set to the exact JSON boolean
+        true — anything else (absent, false, wrong type already
+        rejected in ``validate_request``) fails
+        ``dependency-not-resolved``."""
         needed = 'start' if action == 'prepare' else action
         if definition['category'] in ('archive', 'infrastructure'):
             raise WorkerError('workload-not-mutable')
         if needed not in definition['allowedOperations']:
             raise WorkerError('operation-not-allowed')
-        if definition['dependencies']:
-            raise WorkerError('dependency-readiness-unavailable')
+        if request is not None and definition['dependencies'] \
+                and request.get('dependenciesResolved') is not True:
+            raise WorkerError('dependency-not-resolved')
 
     # -- secret provisioning ------------------------------------------------
 
@@ -1796,7 +1838,7 @@ class Worker(SecurePaths):
         self._require_binding_current(rec)
         bundle, manifest, definition = self._resolve(
             rec['workload_id'], rec['revision_digest'])
-        self._check_action_allowed(definition, 'stop')
+        self._check_action_allowed(definition, 'stop', request)
         if 'backup' not in definition['allowedOperations']:
             raise WorkerError('operation-not-allowed')
         self._check_bundle_host(manifest, definition)
@@ -1834,7 +1876,7 @@ class Worker(SecurePaths):
             if known is not None and request['generation'] <= known[0]:
                 raise WorkerError('generation-stale')
         self._check_bundle_host(manifest, definition)
-        self._check_action_allowed(definition, 'prepare')
+        self._check_action_allowed(definition, 'prepare', request)
         held = rec['workload_id'] if resume else request['workloadId']
         if self._held_capture(held) is not None:
             raise WorkerError('capture-held')
@@ -1959,7 +2001,7 @@ class Worker(SecurePaths):
         bundle, manifest, definition = self._resolve(
             rec['workload_id'], rec['revision_digest'])
         self._check_bundle_host(manifest, definition)
-        self._check_action_allowed(definition, 'start')
+        self._check_action_allowed(definition, 'start', request)
         self._check_generation_current(rec)
         if self._held_capture(rec['workload_id']) is not None:
             raise WorkerError('capture-held')
@@ -2092,7 +2134,7 @@ class Worker(SecurePaths):
         rec = self._get_instance(request['instanceId'])
         self._check_identity(rec, request)
         definition = self._resolve(rec['workload_id'], rec['revision_digest'])[2]
-        self._check_action_allowed(definition, 'stop')
+        self._check_action_allowed(definition, 'stop', request)
         if rec['phase'] in ('preparing', 'starting'):
             raise WorkerError('phase-conflict')
         if rec['phase'] == 'stopped':
@@ -2132,7 +2174,7 @@ class Worker(SecurePaths):
         rec = self._get_instance(request['instanceId'])
         self._check_identity(rec, request)
         definition = self._resolve(rec['workload_id'], rec['revision_digest'])[2]
-        self._check_action_allowed(definition, 'stop')
+        self._check_action_allowed(definition, 'stop', request)
         self.db.execute('UPDATE instances SET retired=1, permit=0, phase=?'
                         ' WHERE instance_id=?',
                         ('stopping', rec['instance_id']))

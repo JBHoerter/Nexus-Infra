@@ -109,7 +109,9 @@ in {
       }
       {
         assertion = cfg.secretsProgram == null
-          || (lib.hasPrefix "/" cfg.secretsConfigFile
+          || (cfg.secretsConfigFile != null
+              && lib.hasPrefix "/" cfg.secretsConfigFile
+              && cfg.secretsBundleDir != null
               && lib.hasPrefix "/" cfg.secretsBundleDir);
         message = "services.nexus-workload-worker.secretsConfigFile and secretsBundleDir must be absolute paths";
       }

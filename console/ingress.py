@@ -133,10 +133,18 @@ def _definitions(registry_config):
 
 
 def _executable(definition):
+    """Whether the workload may legitimately back an ingress route.
+
+    Declared ``dependencies`` are deliberately NOT re-checked here:
+    cross-host dependency readiness is the control plane's gate (the
+    controller's verified closure plus the worker's
+    ``dependenciesResolved`` marker) — it already ran before the
+    workload could be placed and reported running, and the registry
+    only emits a backend on exactly that fresh ready evidence. Routing
+    is not the layer that owns the dep gate."""
     return definition['category'] not in ('archive', 'infrastructure') \
         and 'start' in definition['allowedOperations'] \
-        and definition['secretSetRef'] is None \
-        and not definition['dependencies']
+        and definition['secretSetRef'] is None
 
 
 def _backend(row, backend, definitions, hosts):

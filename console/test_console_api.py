@@ -582,6 +582,128 @@ class ViewTests(unittest.TestCase):
                                 {r['code'] for r in result['reasons']})
                 self.assertFalse(result['eligible'])
 
+    def test_move_check_dependency_readiness(self):
+        """A dep-having workload reports the controller's typed dep
+        blockers naming the failing dependency — not a blanket
+        unavailable reason."""
+        with tempfile.TemporaryDirectory() as directory:
+            dependent = sealed(workloadId='dependent',
+                               dependencies=['broker'])
+            broker = sealed(workloadId='broker')
+            catalog_file = write(
+                os.path.join(directory, 'dep-catalog.json'),
+                [sealed(), dependent, broker])
+            dep_row = placed_on('host-b', workload_id='broker',
+                                instance_id='ef' * 16)
+            routes = {'available': True, 'data': {'routes': [
+                {'id': 'route-broker', 'workloadId': 'broker',
+                 'serviceId': 'web', 'hostname': 'broker.internal',
+                 'backend': None}]}}
+
+            # Serving dep: placed, fresh, running, routed service
+            # ready — the move preview stays clean.
+            snapshot, _ = self._snapshot(
+                directory, catalogFile=catalog_file,
+                workloads=[dep_row])
+            snapshot['registry']['routes'] = routes
+            result = console_api.move_check(snapshot, 'dependent',
+                                            'host-b')
+            self.assertEqual(
+                [r for r in result['reasons']
+                 if r['source'] == 'dependency'], [])
+            self.assertTrue(result['eligible'])
+
+            # Not placed at all: typed blocker naming the dep.
+            unplaced, _ = self._snapshot(
+                directory, catalogFile=catalog_file, workloads=[])
+            result = console_api.move_check(unplaced, 'dependent',
+                                            'host-b')
+            self.assertIn(('dependency-not-placed:broker', 'blocker'),
+                          {(r['code'], r['severity'])
+                           for r in result['reasons']})
+            self.assertFalse(result['eligible'])
+
+            # Placed but stale evidence.
+            stale, _ = self._snapshot(
+                directory, catalogFile=catalog_file,
+                workloads=[dict(dep_row, observedState='stale')])
+            result = console_api.move_check(stale, 'dependent',
+                                            'host-b')
+            self.assertIn('dependency-stale:broker',
+                          {r['code'] for r in result['reasons']})
+            self.assertFalse(result['eligible'])
+
+            # Fresh and running but the routed service is not ready.
+            bare = dict(dep_row)
+            bare['observation'] = dict(dep_row['observation'],
+                                       readyServices=[])
+            not_ready, _ = self._snapshot(
+                directory, catalogFile=catalog_file,
+                workloads=[bare])
+            not_ready['registry']['routes'] = routes
+            result = console_api.move_check(not_ready, 'dependent',
+                                            'host-b')
+            self.assertIn('dependency-not-ready:broker',
+                          {r['code'] for r in result['reasons']})
+            self.assertFalse(result['eligible'])
+
+    def test_move_check_dependency_closure_and_degraded_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = sealed(workloadId='store')
+            app = sealed(workloadId='app', dependencies=['store'])
+            dependent = sealed(workloadId='dependent',
+                               dependencies=['app'])
+            catalog_file = write(
+                os.path.join(directory, 'dep-catalog.json'),
+                [sealed(), dependent, app, store])
+            app_row = placed_on('host-b', workload_id='app',
+                                instance_id='ef' * 16)
+            snapshot, _ = self._snapshot(
+                directory, catalogFile=catalog_file,
+                workloads=[app_row])
+            # The transitive closure is evaluated dep-first: 'app'
+            # serves but 'store' was never placed.
+            result = console_api.move_check(snapshot, 'dependent',
+                                            'host-b')
+            codes = {r['code'] for r in result['reasons']}
+            self.assertIn('dependency-not-placed:store', codes)
+            self.assertNotIn('dependency-not-placed:app', codes)
+            self.assertFalse(result['eligible'])
+            # A reader denied /v2/routes still evaluates placement and
+            # freshness but cannot prove service coverage — an
+            # explicit warning, not a verdict.
+            serving, _ = self._snapshot(
+                directory, catalogFile=catalog_file,
+                workloads=[app_row,
+                           placed_on('host-b', workload_id='store',
+                                     instance_id='f0' * 16)])
+            result = console_api.move_check(serving, 'dependent',
+                                            'host-b')
+            dep = {(r['code'], r['severity'])
+                   for r in result['reasons']
+                   if r['source'] == 'dependency'}
+            self.assertEqual(
+                dep, {('dependency-evidence-unavailable:app',
+                       'warning'),
+                      ('dependency-evidence-unavailable:store',
+                       'warning')})
+            self.assertTrue(result['eligible'])
+            # No registry state at all: the dep check degrades to one
+            # honest warning, never a fabricated not-placed.
+            config = base_config(
+                directory, catalogFile=catalog_file, hosts=[{
+                    'hostId': 'host-a',
+                    'architecture': 'x86_64-linux',
+                    'capabilities': ['userns', 'nspawn-v1'],
+                    'evidenceFile': evidence_file(directory)}])
+            bare = console_api.collect(config, now=NOW)
+            result = console_api.move_check(bare, 'dependent',
+                                            'host-a')
+            self.assertIn(('dependency-evidence-unavailable',
+                           'warning'),
+                          {(r['code'], r['severity'])
+                           for r in result['reasons']})
+
     def test_move_check_warns_without_registry_or_protection(self):
         with tempfile.TemporaryDirectory() as directory:
             config = base_config(directory, hosts=[{

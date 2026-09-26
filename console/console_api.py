@@ -1022,6 +1022,121 @@ def operations_rows(snapshot):
     return sections
 
 
+def _routed_services(snapshot):
+    """workloadId -> routed serviceIds per the ``/v2/routes``
+    projection, or ``None`` when the endpoint was unavailable (a
+    reader identity is legitimately denied it)."""
+    routes = snapshot['registry']['routes']
+    if not routes['available']:
+        return None
+    routed = {}
+    for route in routes['data'].get('routes', []):
+        if type(route) is not dict \
+                or type(route.get('workloadId')) is not str \
+                or type(route.get('serviceId')) is not str:
+            continue
+        routed.setdefault(route['workloadId'], set()).add(
+            route['serviceId'])
+    return routed
+
+
+def _dependency_order(snapshot, definition):
+    """Transitive closure of ``definition['dependencies']`` in
+    dependency-first order — a read-only mirror of
+    ``controller._dependency_order`` over the catalog's current
+    revisions (the console pins one revision per workload, so dep
+    edges come from ``snapshot['definitions']`` rather than placed
+    revisions). ``None`` when the closure is unresolvable — the same
+    graph-invalid verdict the controller raises."""
+    edges = {}
+    pending = list(definition['dependencies'])
+    while pending:
+        dep_id = pending.pop()
+        if dep_id in edges:
+            continue
+        dep_def = snapshot['definitions'].get(dep_id)
+        deps = list(dep_def['dependencies']) \
+            if dep_def is not None else []
+        edges[dep_id] = deps
+        pending.extend(deps)
+    if len(edges) > 64:
+        return None
+    waiting = dict(edges)
+    order = []
+    ready = sorted(dep_id for dep_id, deps in waiting.items()
+                   if not deps)
+    while ready:
+        dep_id = ready.pop(0)
+        if dep_id not in waiting:
+            continue
+        order.append(dep_id)
+        del waiting[dep_id]
+        for other, deps in waiting.items():
+            if dep_id in deps:
+                deps.remove(dep_id)
+                if not deps:
+                    ready.append(other)
+        ready.sort()
+    if waiting:
+        return None
+    return order
+
+
+def _dependency_status(snapshot, dep_id, routed):
+    """Read-only mirror of ``controller._dependency_status``: ``None``
+    when the dep holds a current placement whose fresh observation
+    reports running and covers every routed service (the routed set is
+    skipped — not assumed empty — when ``/v2/routes`` was
+    unavailable)."""
+    row = _placements(snapshot).get(dep_id)
+    if row is None or row.get('instanceId') is None:
+        return 'dependency-not-placed'
+    observation = _fresh_observation(row)
+    if observation is None:
+        return 'dependency-stale'
+    ready = observation.get('readyServices')
+    if row.get('observedState') != 'running' \
+            or type(ready) is not list \
+            or (routed is not None
+                and not routed.get(dep_id, set()) <= set(ready)):
+        return 'dependency-not-ready'
+    return None
+
+
+def _dependency_reasons(snapshot, definition):
+    """Explainable dependency readout for ``move_check``: the same
+    evidence rule the controller's verified-closure gate applies at
+    plan time, evaluated read-only over the registry projections.
+    Every dep in the transitive closure must hold a current placement
+    with a fresh running observation covering its routed services;
+    each failure reports the controller's typed code suffixed with the
+    failing dep id. Evidence the console cannot see degrades honestly:
+    absent registry state makes the whole check a warning (never a
+    fabricated ``dependency-not-placed``), and a ``/v2/routes`` read
+    denied to the reader identity still evaluates placement and
+    freshness but leaves service coverage an explicit warning."""
+    if not snapshot['registry']['state']['available']:
+        return [{'code': 'dependency-evidence-unavailable',
+                 'source': 'dependency', 'severity': 'warning'}]
+    order = _dependency_order(snapshot, definition)
+    if order is None:
+        return [{'code': 'dependency-graph-invalid',
+                 'source': 'dependency', 'severity': 'blocker'}]
+    routed = _routed_services(snapshot)
+    reasons = []
+    for dep_id in order:
+        code = _dependency_status(snapshot, dep_id, routed)
+        if code is not None:
+            reasons.append({'code': code + ':' + dep_id,
+                            'source': 'dependency',
+                            'severity': 'blocker'})
+        elif routed is None:
+            reasons.append({
+                'code': 'dependency-evidence-unavailable:' + dep_id,
+                'source': 'dependency', 'severity': 'warning'})
+    return reasons
+
+
 def move_check(snapshot, workload_id, host_id):
     """Explainable plan preview: every reason a workload cannot move to a
     host, layered by source. Executes nothing."""
@@ -1052,7 +1167,7 @@ def move_check(snapshot, workload_id, host_id):
         if definition['secretSetRef'] is not None:
             blocker('secret-provisioning-unavailable', 'definition')
         if definition['dependencies']:
-            blocker('dependency-readiness-unavailable', 'definition')
+            reasons.extend(_dependency_reasons(snapshot, definition))
     if host is None:
         blocker('unknown-host', 'catalog')
     if not snapshot['registry']['state']['available']:
