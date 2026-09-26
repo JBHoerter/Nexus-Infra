@@ -21,24 +21,33 @@ unseals into a root-0700 private directory only after the envelope,
 the caller-supplied manifest binding and the blob digest all agree —
 contents are never printed, logged or written near the Nix store.
 
-SEALING-PRIMITIVE STATUS — HONESTY NOTE: the cipher primitive is
-deliberately isolated behind the narrow ``Sealer`` seam and the
-default ``UnavailableSealer`` refuses both directions with
-``sealer-unavailable``. No AEAD-capable tool is pinned in the
-workload runtime dependency set (python3, restic, openssh,
-util-linux, coreutils, systemd, nix, iproute2; restic is
-repository-scope only, and ``openssl enc`` — which appears only in
-test fixtures — does not support AEAD modes such as aes-256-gcm).
-A stdlib HMAC+CTR construction would not be a defensible AEAD and is
-therefore not shipped as the default. Confidentiality is claimed
-only once a real pinned AEAD sealer is wired through the seam; the
-envelope contract, manifest binding, integrity proof, private
-provisioning and CLI are complete and exercised against a clearly
-marked test double.
+SEALING PRIMITIVE: ``AgeSealer`` implements the ``Sealer`` seam
+with the pinned ``age`` binary (X25519 recipients; the payload is a
+ChaCha20-Poly1305 STREAM AEAD) as a fixed-argv bounded subprocess.
+The key is a verbatim age key file: an identity file
+(``AGE-SECRET-KEY-1...`` lines plus ``#`` comments, as ``age-keygen``
+emits) seals and opens, while a recipients-only file (public
+``age1...`` lines) seals without ever holding unseal capability —
+the escrow shape is "seal anywhere with the recipient, provision
+only where the identity lives". Secret material never touches a
+filesystem or argv: the child reads the identity through an
+anonymous memfd as ``/proc/self/fd/N``. age accepts no associated
+data, so the SHA-256 of the caller's AAD is prepended to the
+plaintext as a fixed-format header line and verified byte-exact
+after decryption — a blob sealed under one envelope can never open
+under another. The pinned tool supplies no headless passphrase mode
+(``age -p`` prompts on a TTY), so the asymmetric identity model is
+the supported shape. ``UnavailableSealer`` remains the default for
+direct ``SecretsService`` construction — callers opt in — while the
+``nexus-secrets`` CLI wires ``AgeSealer`` when no sealer is
+injected; the ``workload-secrets`` host module pins ``pkgs.age``
+in the wrapper's runtime inputs.
 
 KEY SOURCE: a private euid-owned 0600 key file pinned in a
 root-owned config JSON read through the same safe-ancestor +
-O_NOFOLLOW + fstat pattern as the backup worker's config.
+O_NOFOLLOW + fstat pattern as the backup worker's config. For
+``AgeSealer`` that file is the age identity or recipients file
+described above.
 
 MODULE-NAME NOTE: this file shadows the stdlib ``secrets`` module
 for every sibling module under this directory (``import secrets`` in
@@ -56,7 +65,10 @@ import importlib.util
 import json
 import os
 import re
+import selectors
+import signal
 import stat
+import subprocess
 import sys
 import sysconfig
 import time
@@ -101,10 +113,11 @@ class Sealer:
     and is bound into the sealed bytes through the AAD. ``seal`` maps
     (key, plaintext, aad) to an opaque blob; ``open`` reverses it and
     MUST raise ``SecretsError('unseal-failed')`` — carrying no detail —
-    for any integrity, authenticity or format failure. A production
-    sealer is a fixed-argv bounded subprocess to a pinned AEAD tool;
-    until one exists in the dependency set the default is
-    ``UnavailableSealer`` and no confidentiality claim exists.
+    for any integrity, authenticity or format failure. The production
+    implementation is ``AgeSealer`` (a fixed-argv bounded subprocess to
+    the pinned ``age`` binary); ``UnavailableSealer`` remains the
+    default for direct ``SecretsService`` construction so library
+    callers opt in explicitly.
     """
     scheme = None
 
@@ -116,7 +129,8 @@ class Sealer:
 
 
 class UnavailableSealer(Sealer):
-    """Default sealer: no pinned AEAD primitive exists yet."""
+    """Conservative default: refuse both directions until a caller
+    injects a real sealer such as ``AgeSealer``."""
     scheme = None
 
     def seal(self, key, plaintext, aad):
@@ -204,6 +218,278 @@ def _check_sealer(sealer):
         catalog.identifier(scheme, 'sealingScheme')
     except catalog.CatalogError:
         raise SecretsError('sealer-unavailable') from None
+
+
+# -- age sealer ----------------------------------------------------------
+
+_AGE_SCHEME = 'age-x25519-v1'
+_AGE_TIMEOUT = 60
+_AGE_STDERR_MAX = 64 * 1024
+_AGE_MAX_KEY_LINES = 16
+# Header line prepended to the plaintext before encryption; age
+# takes no AAD, so the caller's AAD is bound by this digest instead
+# and verified byte-exact on open before any plaintext is returned.
+_AGE_HEADER = b'nexus-secret-bundle age-x25519-v1 sha256:'
+_AGE_SECRET_LINE = re.compile(r'AGE-SECRET-KEY-1[0-9A-Za-z]{30,120}')
+_AGE_RECIPIENT_LINE = re.compile(r'age1[0-9a-z]{30,120}')
+
+
+def _age_key_material(key, code):
+    """Split key bytes into ``(identities, recipients)``.
+
+    The key file is a verbatim age key file: blank lines and ``#``
+    comments are ignored; every other line must be an X25519 secret
+    (``AGE-SECRET-KEY-1...``) or public recipient (``age1...``).
+    Anything else — ssh keys, plugin lines, garbage — is rejected so
+    the ``age-x25519-v1`` token can never silently name another
+    primitive."""
+    if type(key) is not bytes:
+        raise SecretsError(code)
+    try:
+        text = key.decode('ascii')
+    except UnicodeDecodeError:
+        raise SecretsError(code) from None
+    identities = []
+    recipients = []
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if _AGE_SECRET_LINE.fullmatch(stripped) is not None:
+            identities.append(stripped)
+        elif _AGE_RECIPIENT_LINE.fullmatch(stripped) is not None:
+            recipients.append(stripped)
+        else:
+            raise SecretsError(code)
+    if not 0 < len(identities) + len(recipients) <= _AGE_MAX_KEY_LINES:
+        raise SecretsError(code)
+    return identities, recipients
+
+
+def _identity_memfd(identities, code):
+    """Copy identity lines into an anonymous memfd. The age child
+    opens it as ``/proc/self/fd/N``: secret material never touches a
+    filesystem, never enters argv and dies with the last fd."""
+    payload = ('\n'.join(identities) + '\n').encode('ascii')
+    try:
+        fd = os.memfd_create('nexus-age-identity')
+    except AttributeError:
+        raise SecretsError('sealer-unavailable') from None
+    except OSError:
+        raise SecretsError(code) from None
+    try:
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError:
+        os.close(fd)
+        raise SecretsError(code) from None
+    return fd
+
+
+class _AgeRunner:
+    """Bounded fixed-argv runner for the pinned ``age`` binary.
+
+    The same discipline as ``repository.BoundedRunner`` — shell-free
+    argv, a new session/process group, a fixed minimal environment,
+    a monotonic deadline, byte caps on both output streams and a
+    whole-group kill on any breach — extended with a nonblocking
+    stdin feed and an inherited-fd table so the identity can ride a
+    memfd (``/proc/self/fd/N``) instead of a filesystem path.
+    Command output and secret material never reach error text; every
+    failure raises ``SecretsError(code)`` with the caller's code.
+    """
+
+    def __init__(self, env=None):
+        self.env = {'PATH': os.environ.get('PATH', os.defpath),
+                    'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'} \
+            if env is None else dict(env)
+
+    def _reap(self, proc):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except (OSError, AttributeError):
+                pass
+
+    def run(self, argv, *, code, data=b'', pass_fds=(),
+            max_out=_MAX_BLOB_BYTES, timeout=_AGE_TIMEOUT):
+        try:
+            proc = subprocess.Popen(
+                argv, shell=False, env=self.env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, start_new_session=True,
+                pass_fds=pass_fds)
+        except OSError:
+            raise SecretsError(code) from None
+        deadline = time.monotonic() + timeout
+        completed = None
+        selector = None
+        try:
+            selector = selectors.DefaultSelector()
+            selector.register(proc.stdout, selectors.EVENT_READ,
+                              ('out', bytearray(), max_out))
+            selector.register(proc.stderr, selectors.EVENT_READ,
+                              ('err', bytearray(), _AGE_STDERR_MAX))
+            os.set_blocking(proc.stdin.fileno(), False)
+            selector.register(proc.stdin, selectors.EVENT_WRITE,
+                              ('in', None, None))
+            pending = memoryview(data)
+            streams = {}
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SecretsError(code)
+                for key, _mask in selector.select(min(remaining, 1.0)):
+                    which, buffer, cap = key.data
+                    if which == 'in':
+                        if not pending:
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                            continue
+                        try:
+                            written = os.write(key.fileobj.fileno(),
+                                               pending)
+                        except BlockingIOError:
+                            continue
+                        except OSError:
+                            # The child closed stdin (failing fast):
+                            # drop the write side, keep draining.
+                            pending = memoryview(b'')
+                            selector.unregister(key.fileobj)
+                            try:
+                                key.fileobj.close()
+                            except OSError:
+                                pass
+                            continue
+                        pending = pending[written:]
+                        if not pending:
+                            selector.unregister(key.fileobj)
+                            try:
+                                key.fileobj.close()
+                            except OSError:
+                                pass
+                        continue
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                    except OSError:
+                        raise SecretsError(code) from None
+                    buffer += chunk
+                    if len(buffer) > cap:
+                        raise SecretsError(code)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    streams[which] = buffer
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SecretsError(code)
+                try:
+                    exit_code = proc.wait(timeout=min(remaining, 1.0))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            completed = subprocess.CompletedProcess(
+                argv, exit_code, bytes(streams.get('out', b'')),
+                bytes(streams.get('err', b'')))
+            return completed
+        except OSError:
+            raise SecretsError(code) from None
+        finally:
+            # Any exception or interruption leaves no live child, no
+            # live process-group member and no open pipe behind.
+            if completed is None:
+                self._reap(proc)
+            else:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    try:
+                        stream.close()
+                    except (OSError, AttributeError):
+                        pass
+            if selector is not None:
+                try:
+                    selector.close()
+                except OSError:
+                    pass
+
+
+class AgeSealer(Sealer):
+    """Real sealer over the pinned ``age`` binary (X25519).
+
+    ``key`` is the raw content of an age key file. Identity files
+    (``AGE-SECRET-KEY-1...`` lines) seal via ``age -e -a -i FD`` — the
+    identity's own recipient — and open via ``age -d -i FD``, with
+    the identity passed on an anonymous memfd so the secret never
+    touches a filesystem or argv. Recipients-only files
+    (``age1...`` lines) seal via ``age -e -a -r RECIPIENT`` and can
+    never open: the escrow shape "seal anywhere with the public
+    recipient, provision only where the identity lives".
+
+    age accepts no associated data, so seal prepends
+    ``_AGE_HEADER + sha256(aad)`` as a header line to the plaintext
+    and open verifies it byte-exact before returning anything — a
+    blob sealed under one envelope can never open under another.
+    """
+    scheme = _AGE_SCHEME
+
+    def __init__(self, *, binary='age', runner=None):
+        self._binary = binary
+        self._runner = _AgeRunner() if runner is None else runner
+
+    def seal(self, key, plaintext, aad):
+        identities, recipients = _age_key_material(key, 'key-invalid')
+        argv = [self._binary, '-e', '-a']
+        fd = None
+        try:
+            if identities:
+                fd = _identity_memfd(identities, 'sealer-failed')
+                argv += ['-i', '/proc/self/fd/' + str(fd)]
+            for recipient in recipients:
+                argv += ['-r', recipient]
+            header = _AGE_HEADER + hashlib.sha256(aad).hexdigest() \
+                .encode('ascii') + b'\n'
+            result = self._runner.run(
+                argv, data=header + plaintext,
+                pass_fds=() if fd is None else (fd,),
+                max_out=_MAX_BLOB_BYTES, code='sealer-failed')
+        finally:
+            if fd is not None:
+                os.close(fd)
+        if result.returncode != 0 or not result.stdout:
+            raise SecretsError('sealer-failed')
+        return result.stdout
+
+    def open(self, key, blob, aad):
+        identities, _recipients = _age_key_material(
+            key, 'unseal-failed')
+        if not identities:
+            raise SecretsError('unseal-failed')
+        fd = _identity_memfd(identities, 'unseal-failed')
+        try:
+            result = self._runner.run(
+                [self._binary, '-d', '-i', '/proc/self/fd/' + str(fd)],
+                data=blob, pass_fds=(fd,),
+                max_out=_MAX_SET_BYTES + 1024, code='unseal-failed')
+        finally:
+            os.close(fd)
+        if result.returncode != 0:
+            raise SecretsError('unseal-failed')
+        raw = result.stdout
+        expect = _AGE_HEADER + hashlib.sha256(aad).hexdigest() \
+            .encode('ascii')
+        line, sep, payload = raw.partition(b'\n')
+        if not sep or line != expect:
+            raise SecretsError('unseal-failed')
+        return payload
 
 
 # -- envelope contract --------------------------------------------------
@@ -935,7 +1221,9 @@ def main(argv=None, *, sealer=None, stdin=None, stdout=None,
     try:
         raw_config = _read_config_file(args.config)
         config = worker.load_json_bytes(raw_config)
-        instance = SecretsService(config, sealer=sealer, clock=clock)
+        instance = SecretsService(
+            config, sealer=AgeSealer() if sealer is None else sealer,
+            clock=clock)
     except (SecretsError, worker.WorkerError) as error:
         _response({'schemaVersion': 1, 'status': 'error',
                    'error': error.code}, stdout)

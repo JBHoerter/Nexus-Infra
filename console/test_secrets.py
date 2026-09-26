@@ -4,7 +4,9 @@ import hmac
 import io
 import json
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -1017,6 +1019,341 @@ class CliTests(SecretsFixture):
         rc, raw = self._run_main(b'{}', {'schemaVersion': 9})
         self.assertEqual(rc, 1)
         self.assertEqual(json.loads(raw)['error'], 'invalid-config')
+
+
+AGE_IDENTITY = (b'# created: test\n# public key: age1' + b'q' * 58
+                + b'\nAGE-SECRET-KEY-1' + b'Q' * 59 + b'\n')
+AGE_RECIPIENT = b'age1' + b'q' * 58
+AGE_RECIPIENTS_KEY = b'# sealing hosts carry only this\n' \
+    + AGE_RECIPIENT + b'\n'
+
+
+class RecordingRunner:
+    """Synthetic ``_AgeRunner`` double for the unit suite: records
+    argv/stdin/fd shape and returns a canned CompletedProcess or
+    raises a canned error — proving the sealer's argv construction
+    and failure mapping without needing the real binary on PATH."""
+
+    def __init__(self, result=None, error=None):
+        self.calls = []
+        self.result = result
+        self.error = error
+
+    def run(self, argv, *, code, data=b'', pass_fds=(),
+            max_out=None, timeout=None):
+        self.calls.append({'argv': list(argv), 'data': bytes(data),
+                           'pass_fds': tuple(pass_fds),
+                           'code': code, 'max_out': max_out})
+        if self.error is not None:
+            raise self.error
+        if self.result is not None:
+            return self.result
+        return subprocess.CompletedProcess(argv, 0, b'', b'')
+
+
+class AgeSealerTests(unittest.TestCase):
+    """AgeSealer seam behavior against a synthetic runner — argv
+    shape, identity-memfd handoff, AAD-header binding and failure
+    mapping. The definitive real-binary proof is
+    tests/workload-secrets.nix; AgeBinaryTests adds a live roundtrip
+    wherever the toolchain is already installed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+        self.private = make_private_dir(self.root, 'private')
+        self.source = make_private_dir(self.root, 'secret-source')
+        write_private_file(os.path.join(self.source, 'api-token'),
+                           SENTINEL)
+        self.aad = artifacts.canonical_bytes(
+            {'kind': secrets._KIND, 'secretSetRef': 'demo-secrets',
+             'sealingScheme': secrets._AGE_SCHEME,
+             'versionDigest': 'sha256:' + 'a' * 64})
+
+    def header(self, aad=None):
+        digest = hashlib.sha256(
+            self.aad if aad is None else aad).hexdigest().encode()
+        return secrets._AGE_HEADER + digest + b'\n'
+
+    def test_scheme_token(self):
+        sealer = secrets.AgeSealer()
+        self.assertEqual(sealer.scheme, 'age-x25519-v1')
+        secrets._check_sealer(sealer)
+
+    def test_seal_identity_uses_memfd_argv(self):
+        runner = RecordingRunner(
+            result=subprocess.CompletedProcess([], 0, b'BLOB', b''))
+        sealer = secrets.AgeSealer(runner=runner)
+        blob = sealer.seal(AGE_IDENTITY, b'PAYLOAD', self.aad)
+        self.assertEqual(blob, b'BLOB')
+        call = runner.calls[0]
+        self.assertEqual(call['argv'][:3], ['age', '-e', '-a'])
+        self.assertEqual(call['argv'][3], '-i')
+        fd_path = call['argv'][4]
+        self.assertTrue(fd_path.startswith('/proc/self/fd/'))
+        fd = int(fd_path.rsplit('/', 1)[1])
+        self.assertEqual(call['pass_fds'], (fd,))
+        # The fd must not outlive the call.
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+        # The caller's AAD digest is prepended as the header line.
+        self.assertEqual(call['data'],
+                         self.header() + b'PAYLOAD')
+        self.assertEqual(call['code'], 'sealer-failed')
+        self.assertEqual(call['max_out'], secrets._MAX_BLOB_BYTES)
+
+    def test_seal_recipients_only_never_materializes_secret(self):
+        runner = RecordingRunner(
+            result=subprocess.CompletedProcess([], 0, b'BLOB', b''))
+        sealer = secrets.AgeSealer(runner=runner)
+        sealer.seal(AGE_RECIPIENTS_KEY, b'PAYLOAD', self.aad)
+        call = runner.calls[0]
+        self.assertEqual(
+            call['argv'], ['age', '-e', '-a', '-r',
+                           AGE_RECIPIENT.decode()])
+        self.assertEqual(call['pass_fds'], ())
+
+    def test_seal_identity_plus_recipient(self):
+        key = AGE_IDENTITY + AGE_RECIPIENT + b'\n'
+        runner = RecordingRunner(
+            result=subprocess.CompletedProcess([], 0, b'BLOB', b''))
+        secrets.AgeSealer(runner=runner).seal(key, b'P', self.aad)
+        argv = runner.calls[0]['argv']
+        self.assertEqual(argv[:3], ['age', '-e', '-a'])
+        self.assertIn('-i', argv)
+        self.assertEqual(argv[-2:],
+                         ['-r', AGE_RECIPIENT.decode()])
+
+    def test_seal_rejects_non_age_key_lines(self):
+        for bad in (b'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 hostkey',
+                    b'AGE-PLUGIN-WHATEVER-1xyz',
+                    b'AGE-SECRET-KEY-1' + b'Q' * 59
+                    + 'é'.encode('utf-8'),
+                    b'AGE-SECRET-KEY-1short', b'\n\n# nothing\n'):
+            sealer = secrets.AgeSealer(
+                runner=RecordingRunner(
+                    result=subprocess.CompletedProcess(
+                        [], 0, b'B', b'')))
+            with self.subTest(bad=bad), \
+                    self.assertRaises(secrets.SecretsError) as ctx:
+                sealer.seal(bad, b'P', self.aad)
+            self.assertEqual(ctx.exception.code, 'key-invalid')
+
+    def test_seal_failure_mapping(self):
+        # Nonzero exit and empty output both fail closed.
+        for result in (subprocess.CompletedProcess([], 1, b'', b''),
+                       subprocess.CompletedProcess([], 0, b'', b'')):
+            sealer = secrets.AgeSealer(
+                runner=RecordingRunner(result=result))
+            with self.assertRaises(secrets.SecretsError) as ctx:
+                sealer.seal(AGE_IDENTITY, b'P', self.aad)
+            self.assertEqual(ctx.exception.code, 'sealer-failed')
+        # Runner-level failures surface as the caller's code.
+        sealer = secrets.AgeSealer(runner=RecordingRunner(
+            error=secrets.SecretsError('sealer-failed')))
+        with self.assertRaises(secrets.SecretsError) as ctx:
+            sealer.seal(AGE_IDENTITY, b'P', self.aad)
+        self.assertEqual(ctx.exception.code, 'sealer-failed')
+
+    def test_open_verifies_header_before_returning(self):
+        payload = b'{"schemaVersion":1}'
+        runner = RecordingRunner(
+            result=subprocess.CompletedProcess(
+                [], 0, self.header() + payload, b''))
+        sealer = secrets.AgeSealer(runner=runner)
+        self.assertEqual(
+            sealer.open(AGE_IDENTITY, b'BLOB', self.aad), payload)
+        call = runner.calls[0]
+        self.assertEqual(call['argv'][:3], ['age', '-d', '-i'])
+        self.assertTrue(
+            call['argv'][3].startswith('/proc/self/fd/'))
+        self.assertEqual(call['pass_fds'],
+                         (int(call['argv'][3].rsplit('/', 1)[1]),))
+        self.assertEqual(call['data'], b'BLOB')
+        self.assertEqual(call['code'], 'unseal-failed')
+
+    def test_open_rejects_foreign_aad(self):
+        # A blob sealed under a different envelope fails the header
+        # check even when the decryption itself "succeeds".
+        other_aad = artifacts.canonical_bytes(
+            {'kind': secrets._KIND, 'secretSetRef': 'other',
+             'sealingScheme': secrets._AGE_SCHEME,
+             'versionDigest': 'sha256:' + 'b' * 64})
+        runner = RecordingRunner(
+            result=subprocess.CompletedProcess(
+                [], 0, self.header(other_aad) + b'P', b''))
+        sealer = secrets.AgeSealer(runner=runner)
+        with self.assertRaises(secrets.SecretsError) as ctx:
+            sealer.open(AGE_IDENTITY, b'BLOB', self.aad)
+        self.assertEqual(ctx.exception.code, 'unseal-failed')
+
+    def test_open_fails_closed(self):
+        # Nonzero exit, missing header, malformed key and a
+        # recipients-only key all collapse to unseal-failed.
+        cases = [
+            RecordingRunner(
+                result=subprocess.CompletedProcess([], 1, b'x', b'')),
+            RecordingRunner(
+                result=subprocess.CompletedProcess(
+                    [], 0, b'no header line', b'')),
+        ]
+        for runner in cases:
+            with self.subTest(runner=runner), \
+                    self.assertRaises(secrets.SecretsError) as ctx:
+                secrets.AgeSealer(runner=runner).open(
+                    AGE_IDENTITY, b'BLOB', self.aad)
+            self.assertEqual(ctx.exception.code, 'unseal-failed')
+        for key in (b'not a key at all not a key at all!',
+                    AGE_RECIPIENTS_KEY):
+            runner = RecordingRunner()
+            with self.subTest(key=key[:20]), \
+                    self.assertRaises(secrets.SecretsError) as ctx:
+                secrets.AgeSealer(runner=runner).open(
+                    key, b'BLOB', self.aad)
+            self.assertEqual(ctx.exception.code, 'unseal-failed')
+            # No subprocess is even spawned without an identity.
+            self.assertEqual(runner.calls, [])
+
+    def test_full_roundtrip_through_envelope(self):
+        """seal() + provision() with AgeSealer objects on both sides:
+        the open runner replays exactly what the seal runner fed the
+        binary, so the whole envelope/binding/inner-decode path runs
+        for real under the age scheme token."""
+        seal_runner = RecordingRunner(
+            result=subprocess.CompletedProcess([], 0, b'SEALED', b''))
+        blob, envelope = secrets.seal(
+            self.source, 'demo-secrets', key=AGE_IDENTITY,
+            sealer=secrets.AgeSealer(runner=seal_runner),
+            clock=lambda: 1700)
+        self.assertEqual(blob, b'SEALED')
+        self.assertEqual(envelope['sealingScheme'], 'age-x25519-v1')
+        open_runner = RecordingRunner(
+            result=subprocess.CompletedProcess(
+                [], 0, seal_runner.calls[0]['data'], b''))
+        target = os.path.join(self.private, 'age-target')
+        record = secrets.provision(
+            envelope, blob, target, key=AGE_IDENTITY,
+            sealer=secrets.AgeSealer(runner=open_runner),
+            binding=secrets.manifest_binding(envelope))
+        self.assertEqual(record['fileCount'], 1)
+        with open(os.path.join(target, 'api-token'), 'rb') as handle:
+            self.assertEqual(handle.read(), SENTINEL)
+        # A foreign scheme token can never satisfy this envelope.
+        with self.assertRaises(secrets.SecretsError) as ctx:
+            secrets.provision(
+                envelope, blob,
+                os.path.join(self.private, 'age-foreign'),
+                key=KEY, sealer=ToySealer(), binding=None)
+        self.assertEqual(ctx.exception.code, 'sealing-scheme-unknown')
+
+    def test_service_plumbs_keyfile_to_sealer(self):
+        config = {'schemaVersion': 1, 'keyFile': write_private_file(
+            os.path.join(self.private, 'age-key'), AGE_IDENTITY)}
+        runner = RecordingRunner(
+            result=subprocess.CompletedProcess([], 0, b'B', b''))
+        service = secrets.SecretsService(
+            config, sealer=secrets.AgeSealer(runner=runner),
+            clock=lambda: 1700)
+        response = service.execute(
+            {'schemaVersion': 1, 'action': 'seal',
+             'secretSetRef': 'demo-secrets', 'sourceDir': self.source,
+             'bundleFile': os.path.join(self.private, 'b.bin')})
+        self.assertEqual(response['status'], 'completed', response)
+        self.assertEqual(len(runner.calls), 1)
+
+
+@unittest.skipUnless(
+    shutil.which('age') and shutil.which('age-keygen'),
+    'age toolchain not on PATH')
+class AgeBinaryTests(SecretsFixture):
+    """Live roundtrip against the real age binary when present. The
+    definitive pinned-binary proof is the in-guest fixture
+    tests/workload-secrets.nix; this gate only covers machines that
+    already carry the toolchain."""
+
+    def setUp(self):
+        super().setUp()
+        identity = subprocess.run(['age-keygen'], capture_output=True)
+        self.assertEqual(identity.returncode, 0)
+        self.age_key = identity.stdout
+        self.other_key = subprocess.run(
+            ['age-keygen'], capture_output=True).stdout
+        key_path = write_private_file(
+            os.path.join(self.private, 'identity'), self.age_key)
+        recip = subprocess.run(['age-keygen', '-y', key_path],
+                               capture_output=True)
+        self.assertEqual(recip.returncode, 0)
+        self.recipients_key = recip.stdout.strip() + b'\n'
+        self.sealer = secrets.AgeSealer()
+
+    def test_real_roundtrip_and_no_leak(self):
+        envelope, blob = self.sealed_pair(key=self.age_key)
+        self.assertTrue(
+            blob.startswith(b'-----BEGIN AGE ENCRYPTED FILE-----'))
+        self.assert_no_leak(blob)
+        record = secrets.provision(
+            envelope, blob,
+            os.path.join(self.private, 'age-live'),
+            key=self.age_key, sealer=self.sealer,
+            binding=secrets.manifest_binding(envelope))
+        self.assertEqual(record['fileCount'], 2)
+        with open(os.path.join(self.private, 'age-live',
+                               'api-token'), 'rb') as handle:
+            self.assertEqual(handle.read(), SENTINEL)
+
+    def test_recipient_seals_only_identity_opens(self):
+        """The escrow shape: a sealing host holding only the public
+        recipient produces a bundle only the identity holder opens."""
+        envelope, blob = self.sealed_pair(key=self.recipients_key)
+        record = secrets.provision(
+            envelope, blob,
+            os.path.join(self.private, 'age-escrow'),
+            key=self.age_key, sealer=self.sealer,
+            binding=secrets.manifest_binding(envelope))
+        self.assertEqual(record['fileCount'], 2)
+        # The recipients file alone can never provision.
+        with self.assertRaises(secrets.SecretsError) as ctx:
+            secrets.provision(
+                envelope, blob,
+                os.path.join(self.private, 'age-nokey'),
+                key=self.recipients_key, sealer=self.sealer,
+                binding=secrets.manifest_binding(envelope))
+        self.assertEqual(ctx.exception.code, 'unseal-failed')
+
+    def test_wrong_identity_and_tamper_fail(self):
+        envelope, blob = self.sealed_pair(key=self.age_key)
+        with self.assertRaises(secrets.SecretsError) as ctx:
+            secrets.provision(
+                envelope, blob,
+                os.path.join(self.private, 'age-wrong'),
+                key=self.other_key, sealer=self.sealer,
+                binding=secrets.manifest_binding(envelope))
+        self.assertEqual(ctx.exception.code, 'unseal-failed')
+        tampered = bytearray(blob)
+        tampered[len(tampered) // 2] ^= 0x01
+        forged = dict(envelope)
+        forged['bundleDigest'] = 'sha256:' + hashlib.sha256(
+            bytes(tampered)).hexdigest()
+        with self.assertRaises(secrets.SecretsError) as ctx:
+            secrets.provision(
+                forged, bytes(tampered),
+                os.path.join(self.private, 'age-tampered'),
+                key=self.age_key, sealer=self.sealer, binding=None)
+        self.assertEqual(ctx.exception.code, 'unseal-failed')
+
+    def test_rebound_envelope_fails_on_real_binary(self):
+        """A blob sealed under one envelope cannot satisfy a forged
+        one — the sealed AAD-header catches what age does not."""
+        envelope, blob = self.sealed_pair(key=self.age_key)
+        forged = dict(envelope)
+        forged['secretSetRef'] = 'other-secrets'
+        with self.assertRaises(secrets.SecretsError) as ctx:
+            secrets.provision(
+                forged, blob,
+                os.path.join(self.private, 'age-forged'),
+                key=self.age_key, sealer=self.sealer, binding=None)
+        self.assertEqual(ctx.exception.code, 'unseal-failed')
 
 
 class StdlibShadowTests(unittest.TestCase):
