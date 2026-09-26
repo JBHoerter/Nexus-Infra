@@ -449,6 +449,118 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(status, 403, payload)
             self.assertEqual(payload['error'], 'browser-request-forbidden')
 
+    def test_operations_dispatch_flow(self):
+        # Controller posts; owning host polls, claims, completes.
+        self.post_json('controller', '/v2/placements/assign',
+                       test_registry.assign_request())
+        operation = test_registry.operation_request()
+        status, payload = self.post_json('controller',
+                                         '/v2/operations', operation)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['status'], 'accepted')
+        self.assertEqual(payload['operationId'], '11' * 16)
+        # Replay on requestId is identical; a changed payload 409s.
+        status, again = self.post_json('controller', '/v2/operations',
+                                       operation)
+        self.assertEqual((status, again), (200, payload))
+        status, payload = self.post_json(
+            'controller', '/v2/operations',
+            test_registry.operation_request(step='start', payload={
+                'schemaVersion': 1, 'operationId': '11' * 16,
+                'action': 'start', 'workloadId': 'canary',
+                'revisionDigest': test_registry.DIGEST,
+                'instanceId': test_registry.I1, 'generation': 1}))
+        self.assertEqual(status, 409, payload)
+        # The host sees only its own pending operations.
+        context = self.client_context('host-a')
+        status, listed = self.call(context, 'GET',
+                                   '/v2/operations?host=host-a&after=0')
+        self.assertEqual(status, 200, listed)
+        self.assertEqual(len(listed['operations']), 1)
+        self.assertEqual(listed['operations'][0]['operationId'],
+                         '11' * 16)
+        status, empty = self.call(self.client_context('host-b'), 'GET',
+                                  '/v2/operations?host=host-b&after=0')
+        self.assertEqual((status, empty['operations']), (200, []))
+        # Claim then complete over the wire.
+        status, payload = self.post_json(
+            'host-a', '/v2/operations/{}/receipt'.format('11' * 16),
+            test_registry.receipt('claimed'))
+        self.assertEqual((status, payload['receipt']),
+                         (200, 'claimed'))
+        status, payload = self.post_json(
+            'host-a', '/v2/operations/{}/receipt'.format('11' * 16),
+            test_registry.receipt('completed', '44' * 16,
+                                  result={'appliedPhase': 'stopped'}))
+        self.assertEqual(status, 200, payload)
+        # Controller reads back the receipt for the op it posted.
+        status, view = self.call(
+            self.client_context('controller'), 'GET',
+            '/v2/operations/{}?requestId={}'.format('11' * 16,
+                                                  '22' * 16))
+        self.assertEqual(status, 200, view)
+        self.assertEqual(view['status'], 'completed')
+        self.assertEqual(view['result'],
+                         {'appliedPhase': 'stopped'})
+
+    def test_operations_wrong_roles_and_foreign_host(self):
+        self.post_json('controller', '/v2/placements/assign',
+                       test_registry.assign_request())
+        for name in ('reader', 'ingress', 'host-a'):
+            status, payload = self.post_json(
+                name, '/v2/operations',
+                test_registry.operation_request())
+            self.assertEqual(status, 403, (name, payload))
+        self.post_json('controller', '/v2/operations',
+                       test_registry.operation_request())
+        # Wrong host cannot claim or complete.
+        for body in (test_registry.receipt('claimed'),
+                     test_registry.receipt('failed', '44' * 16,
+                                           errorCode='x')):
+            status, payload = self.post_json(
+                'host-b',
+                '/v2/operations/{}/receipt'.format('11' * 16), body)
+            self.assertEqual(status, 403, payload)
+            self.assertEqual(payload['error'], 'host-mismatch')
+        # Host cannot poll another host's queue nor read op status.
+        status, payload = self.call(
+            self.client_context('host-b'), 'GET',
+            '/v2/operations?host=host-a&after=0')
+        self.assertEqual(status, 403, payload)
+        status, payload = self.call(
+            self.client_context('host-a'), 'GET',
+            '/v2/operations/{}?requestId={}'.format('11' * 16,
+                                                  '22' * 16))
+        self.assertEqual(status, 403, payload)
+        # Controller with a foreign requestId cannot read it either.
+        status, payload = self.call(
+            self.client_context('controller'), 'GET',
+            '/v2/operations/{}?requestId={}'.format('11' * 16,
+                                                  '88' * 16))
+        self.assertEqual(status, 403, payload)
+
+    def test_operations_strict_query(self):
+        context = self.client_context('host-a')
+        for path in ('/v2/operations?host=host-a&after=x',
+                     '/v2/operations?host=host-a&bogus=1',
+                     '/v2/operations?host=host-a&after=1&after=2',
+                     '/v2/operations?' + 'a' * 200):
+            status, payload = self.call(context, 'GET', path)
+            self.assertEqual(status, 400, path)
+        # Query strings on the legacy paths still 404.
+        status, payload = self.call(
+            self.client_context('reader'), 'GET', '/v2/state?x=1')
+        self.assertEqual(status, 404, payload)
+        # Unknown operation ids and malformed receipt paths.
+        status, payload = self.post_json(
+            'host-a', '/v2/operations/{}/receipt'.format('99' * 16),
+            test_registry.receipt('claimed'))
+        self.assertEqual(status, 404, payload)
+        status, payload = self.call(
+            context, 'GET', '/v2/operations/{}/receipt'.format(
+                '11' * 16))
+        self.assertEqual(status, 404, payload)
+
     def test_nonce_validation(self):
         context = self.client_context('ingress')
         for nonce in (None, 'xyz', test_registry.NONCE.upper()):

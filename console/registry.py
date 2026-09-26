@@ -1,4 +1,5 @@
-"""Durable registry core for workload placement and retirement (M3).
+"""Durable registry core for workload placement and retirement (M3)
+plus the pull-model operation-dispatch queue (M5).
 
 Internal library only: callers pass a Principal constructed by a future
 authenticated transport. Roles and identities are trusted caller inputs until
@@ -7,6 +8,16 @@ observations are self-reported evidence: a missing or stale sample is never
 proof a host is down, and a reported retirement is not off-host fencing. A
 successor placement requires a fresh, current-session observation proving the
 old instance retired AND drained.
+
+The operation queue is a rendezvous, not a control channel: a controller
+POSTs a bounded operation bound to the CURRENT placement generation of a
+workload and to the host holding that generation; the owning host polls
+``operations`` for pending rows, claims each with a first-wins receipt,
+executes it locally and posts a terminal receipt. Receipts are
+exactly-once per requestId — identical replays are accepted, conflicting
+ones rejected — and the registry never executes anything itself. A stale
+generation or a generation bound to another host is rejected at post
+time; this is control-plane trust, not fencing.
 """
 import copy
 import fcntl
@@ -55,6 +66,14 @@ _OBSERVATION_FIELDS = {'schemaVersion', 'hostId', 'sessionId', 'sequence',
                        'generation', 'observedAt', 'phase', 'unitActiveState',
                        'unitDrained', 'retired', 'endpointAddress',
                        'readyServices'}
+_OPERATION_FIELDS = {'schemaVersion', 'requestId', 'operationId',
+                     'workloadId', 'hostId', 'generation', 'step', 'payload'}
+_OPERATION_STEPS = ('prepare', 'restore-stage', 'restore-commit', 'start',
+                    'stop', 'observe', 'freeze', 'capture', 'thaw', 'retire')
+_OPERATION_STATUSES = ('pending', 'claimed', 'completed', 'failed')
+_RECEIPT_BASE = {'schemaVersion', 'requestId', 'status'}
+_OPERATION_PENDING_MAX = 256
+_OPERATION_POLL_MAX = 64
 
 _SCHEMA = '''
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -74,6 +93,14 @@ CREATE TABLE IF NOT EXISTS observations(instance_id TEXT PRIMARY KEY,
 CREATE TABLE IF NOT EXISTS requests(request_id TEXT PRIMARY KEY,
     principal TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL,
     receipt TEXT NOT NULL);
+INSERT OR IGNORE INTO meta VALUES('operationSequence',0);
+CREATE TABLE IF NOT EXISTS operations(operation_id TEXT PRIMARY KEY,
+    seq INTEGER NOT NULL UNIQUE, host_id TEXT NOT NULL,
+    workload_id TEXT NOT NULL, generation INTEGER NOT NULL,
+    step TEXT NOT NULL, payload TEXT NOT NULL,
+    request_id TEXT NOT NULL UNIQUE, principal TEXT NOT NULL,
+    status TEXT NOT NULL, claim_request_id TEXT, claim_body TEXT,
+    final_request_id TEXT, final_body TEXT);
 '''
 
 
@@ -252,6 +279,74 @@ def _validate_observation(request, now):
     return request
 
 
+def _bounded_payload(value, depth=0):
+    """Operation payloads and receipt results must stay small, strict
+    JSON trees — the registry stores but never interprets them."""
+    if depth > 8:
+        raise RegistryError('invalid-payload')
+    if type(value) is dict:
+        if len(value) > 32:
+            raise RegistryError('invalid-payload')
+        for key, item in value.items():
+            if type(key) is not str or not key or len(key) > 64:
+                raise RegistryError('invalid-payload')
+            _bounded_payload(item, depth + 1)
+    elif type(value) is list:
+        if len(value) > 64:
+            raise RegistryError('invalid-payload')
+        for item in value:
+            _bounded_payload(item, depth + 1)
+    elif type(value) is str:
+        if len(value) > 512:
+            raise RegistryError('invalid-payload')
+    elif type(value) is int:
+        if not 0 <= value <= 2**53:
+            raise RegistryError('invalid-payload')
+    elif value is not None and type(value) is not bool:
+        raise RegistryError('invalid-payload')
+
+
+def _validate_operation(request):
+    _check(worker._fields, request, _OPERATION_FIELDS, 'request')
+    _check(worker._integer, request['schemaVersion'], 2, 2,
+           'schemaVersion')
+    _check(worker._hex32, request['requestId'], 'requestId')
+    _check(worker._hex32, request['operationId'], 'operationId')
+    _check(worker._identifier, request['workloadId'], 'workloadId')
+    _check(worker._identifier, request['hostId'], 'hostId')
+    _check(worker._integer, request['generation'], 1, _MAX_I64,
+           'generation')
+    if request['step'] not in _OPERATION_STEPS:
+        raise RegistryError('invalid-step')
+    if type(request['payload']) is not dict:
+        raise RegistryError('invalid-payload')
+    _bounded_payload(request['payload'])
+    return request
+
+
+def _validate_receipt(request):
+    if type(request) is not dict:
+        raise RegistryError('invalid-request-fields')
+    status = request.get('status')
+    if status == 'claimed':
+        expected = _RECEIPT_BASE
+    elif status == 'completed':
+        expected = _RECEIPT_BASE | {'result'}
+    elif status == 'failed':
+        expected = _RECEIPT_BASE | {'errorCode'}
+    else:
+        raise RegistryError('invalid-status')
+    _check(worker._fields, request, expected, 'request')
+    _check(worker._integer, request['schemaVersion'], 2, 2,
+           'schemaVersion')
+    _check(worker._hex32, request['requestId'], 'requestId')
+    if status == 'completed':
+        _bounded_payload(request['result'])
+    elif status == 'failed':
+        _check(worker._identifier, request['errorCode'], 'errorCode')
+    return request
+
+
 class Registry:
     def __init__(self, config, db_path, *, clock=time.time,
                  monotonic=time.monotonic, epoch=None):
@@ -347,6 +442,14 @@ class Registry:
         for (instance_id,) in self.db.execute(
                 'SELECT instance_id FROM placements'):
             if instance_id not in known:
+                raise RegistryError('registry-config-incompatible', 409)
+        generations = {(row[0], row[1]) for row in self.db.execute(
+            'SELECT workload_id, generation FROM instances')}
+        for host_id, workload_id, generation in self.db.execute(
+                'SELECT host_id, workload_id, generation'
+                ' FROM operations'):
+            if host_id not in self._hosts \
+                    or (workload_id, generation) not in generations:
                 raise RegistryError('registry-config-incompatible', 409)
 
     def _now(self):
@@ -698,6 +801,173 @@ class Registry:
                         {'instanceId': row[0], 'workloadId': row[1],
                          'revisionDigest': row[2], 'hostId': row[3],
                          'generation': row[4]} for row in rows]}
+
+    # -- operation dispatch queue (M5) -------------------------------------
+
+    def post_operation(self, principal, request):
+        """Controller-only enqueue. The operation binds to the CURRENT
+        placement generation and to the host that holds it; replays on
+        ``requestId`` return the recorded acceptance."""
+        with self._mutex:
+            self._principal(principal, ('controller',))
+            req = _validate_operation(request)
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                replay = self._request_replay(principal, 'operation', req)
+                if replay is not None:
+                    self._commit()
+                    return replay
+                if req['workloadId'] not in self._revisions:
+                    raise RegistryError('unknown-workload', 404)
+                if req['hostId'] not in self._hosts:
+                    raise RegistryError('unknown-host', 404)
+                placement = self._placement(req['workloadId'])
+                if placement is None \
+                        or placement[0] != req['generation']:
+                    raise RegistryError('generation-conflict', 409)
+                instance = self._instance(placement[1])
+                if instance is None or instance[2] != req['hostId']:
+                    raise RegistryError('generation-conflict', 409)
+                if self.db.execute(
+                        'SELECT 1 FROM operations WHERE operation_id=?',
+                        (req['operationId'],)).fetchone() is not None:
+                    raise RegistryError('operation-conflict', 409)
+                queued = self.db.execute(
+                    "SELECT COUNT(*) FROM operations WHERE host_id=?"
+                    " AND status IN ('pending','claimed')",
+                    (req['hostId'],)).fetchone()[0]
+                if queued >= _OPERATION_PENDING_MAX:
+                    raise RegistryError('operation-queue-full', 409)
+                self.db.execute(
+                    "UPDATE meta SET value=value+1"
+                    " WHERE key='operationSequence'")
+                seq = self.db.execute(
+                    "SELECT value FROM meta"
+                    " WHERE key='operationSequence'").fetchone()[0]
+                self.db.execute(
+                    'INSERT INTO operations(operation_id, seq, host_id,'
+                    ' workload_id, generation, step, payload, request_id,'
+                    ' principal, status) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                    (req['operationId'], seq, req['hostId'],
+                     req['workloadId'], req['generation'], req['step'],
+                     artifacts.canonical_bytes(req['payload']).decode(
+                         'utf-8'),
+                     req['requestId'], self._principal_key(principal),
+                     'pending'))
+                receipt = {'schemaVersion': 2, 'status': 'accepted',
+                           'requestId': req['requestId'],
+                           'operationId': req['operationId'], 'seq': seq}
+                self._record_request(principal, 'operation', req, receipt)
+                self._bump()
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+            return receipt
+
+    def poll_operations(self, principal, host_id, after):
+        """Host-only pull: pending operations addressed to the caller's
+        own host, in durable sequence order, strictly after ``after``."""
+        with self._mutex:
+            self._principal(principal, ('host',))
+            _check(worker._identifier, host_id, 'host')
+            self._own_host(principal, host_id)
+            _check(worker._integer, after, 0, _MAX_I64, 'after')
+            rows = self.db.execute(
+                "SELECT seq, operation_id, workload_id, generation, step,"
+                " payload FROM operations WHERE host_id=? AND"
+                " status='pending' AND seq>? ORDER BY seq LIMIT ?",
+                (host_id, after, _OPERATION_POLL_MAX)).fetchall()
+            return {'schemaVersion': 2, 'hostId': host_id,
+                    'operations': [
+                        {'seq': row[0], 'operationId': row[1],
+                         'workloadId': row[2], 'generation': row[3],
+                         'step': row[4], 'payload': json.loads(row[5])}
+                        for row in rows]}
+
+    def operation_receipt(self, principal, operation_id, request):
+        """Host-only receipt write. Exactly-once per transition:
+        pending -> claimed (first claim wins) -> completed|failed.
+        Identical replays of a recorded receipt are accepted; conflicts
+        are rejected."""
+        with self._mutex:
+            self._principal(principal, ('host',))
+            _check(worker._hex32, operation_id, 'operationId')
+            req = _validate_receipt(request)
+            body = artifacts.canonical_bytes(req).decode('utf-8')
+            response = {'schemaVersion': 2, 'status': 'accepted',
+                        'operationId': operation_id,
+                        'receipt': req['status']}
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                row = self.db.execute(
+                    'SELECT host_id, status, claim_request_id, claim_body,'
+                    ' final_request_id, final_body FROM operations'
+                    ' WHERE operation_id=?', (operation_id,)).fetchone()
+                if row is None:
+                    raise RegistryError('unknown-operation', 404)
+                self._own_host(principal, row[0])
+                if req['status'] == 'claimed':
+                    if row[1] == 'pending':
+                        self.db.execute(
+                            "UPDATE operations SET status='claimed',"
+                            ' claim_request_id=?, claim_body=?'
+                            ' WHERE operation_id=?',
+                            (req['requestId'], body, operation_id))
+                        self._bump()
+                        self._commit()
+                        return response
+                    if row[2] == req['requestId'] and row[3] == body:
+                        self._commit()
+                        return response
+                    raise RegistryError('receipt-conflict', 409)
+                if row[1] == 'pending':
+                    raise RegistryError('operation-not-claimed', 409)
+                if row[4] == req['requestId'] and row[5] == body:
+                    self._commit()
+                    return response
+                if row[1] == 'claimed' and row[4] is None:
+                    self.db.execute(
+                        'UPDATE operations SET status=?,'
+                        ' final_request_id=?, final_body=?'
+                        ' WHERE operation_id=?',
+                        (req['status'], req['requestId'], body,
+                         operation_id))
+                    self._bump()
+                    self._commit()
+                    return response
+                raise RegistryError('receipt-conflict', 409)
+            except BaseException:
+                self._rollback()
+                raise
+
+    def operation_status(self, principal, operation_id, request_id):
+        """Controller-only read of one operation it posted. The stored
+        ``requestId`` and posting principal must both match."""
+        with self._mutex:
+            self._principal(principal, ('controller',))
+            _check(worker._hex32, operation_id, 'operationId')
+            _check(worker._hex32, request_id, 'requestId')
+            row = self.db.execute(
+                'SELECT request_id, principal, workload_id, host_id,'
+                ' generation, step, status, final_body FROM operations'
+                ' WHERE operation_id=?', (operation_id,)).fetchone()
+            if row is None:
+                raise RegistryError('unknown-operation', 404)
+            if row[0] != request_id \
+                    or row[1] != self._principal_key(principal):
+                raise RegistryError('forbidden', 403)
+            view = {'schemaVersion': 2, 'operationId': operation_id,
+                    'requestId': request_id, 'workloadId': row[2],
+                    'hostId': row[3], 'generation': row[4],
+                    'step': row[5], 'status': row[6]}
+            if row[6] in ('completed', 'failed'):
+                final = json.loads(row[7])
+                if row[6] == 'completed':
+                    view['result'] = final['result']
+                else:
+                    view['errorCode'] = final['errorCode']
+            return view
 
     def _observed_state(self, observation, host_id, now, mono):
         if observation is None:

@@ -659,3 +659,305 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(result['status'], 'completed')
             state = reg.state(READER)
             self.assertEqual(state['workloads'][0]['generation'], 1)
+
+
+def operation_request(step='observe', operation_id='11' * 16,
+                      request_id='22' * 16, host='host-a', generation=1,
+                      workload='canary', payload=None):
+    if payload is None:
+        payload = {'schemaVersion': 1, 'action': 'observe',
+                   'instanceId': I1}
+    return {'schemaVersion': 2, 'requestId': request_id,
+            'operationId': operation_id, 'workloadId': workload,
+            'hostId': host, 'generation': generation, 'step': step,
+            'payload': payload}
+
+
+def _deep_tree(depth):
+    value = {}
+    current = value
+    for _ in range(depth):
+        current['k'] = {}
+        current = current['k']
+    return value
+
+
+def receipt(status, request_id='33' * 16, **extra):
+    body = {'schemaVersion': 2, 'requestId': request_id,
+            'status': status}
+    body.update(extra)
+    return body
+
+
+class OperationQueueTests(unittest.TestCase):
+    """The M5 pull-model dispatch queue: post, poll, claim, receipt."""
+
+    def placed(self, tmp, host='host-a'):
+        reg, fake = make_registry(tmp)
+        reg.assign(CONTROLLER, assign_request(
+            I1, host, 0, 'a1' * 16))
+        return reg, fake
+
+    def test_post_poll_claim_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = self.placed(tmp)
+            accepted = reg.post_operation(
+                CONTROLLER, operation_request())
+            self.assertEqual(accepted['status'], 'accepted')
+            self.assertEqual(accepted['operationId'], '11' * 16)
+            self.assertEqual(accepted['seq'], 1)
+            listed = reg.poll_operations(P_HOST_A, 'host-a', 0)
+            self.assertEqual(listed['hostId'], 'host-a')
+            self.assertEqual(len(listed['operations']), 1)
+            op = listed['operations'][0]
+            self.assertEqual(op['operationId'], '11' * 16)
+            self.assertEqual(op['step'], 'observe')
+            self.assertEqual(op['payload']['instanceId'], I1)
+            # after-cursor paging: seq 1 is not re-delivered.
+            self.assertEqual(
+                reg.poll_operations(P_HOST_A, 'host-a', 1)
+                ['operations'], [])
+            claim = reg.operation_receipt(
+                P_HOST_A, '11' * 16, receipt('claimed'))
+            self.assertEqual(claim['status'], 'accepted')
+            self.assertEqual(claim['receipt'], 'claimed')
+            # Claimed ops are no longer pending.
+            self.assertEqual(
+                reg.poll_operations(P_HOST_A, 'host-a', 0)
+                ['operations'], [])
+            done = reg.operation_receipt(
+                P_HOST_A, '11' * 16,
+                receipt('completed', '44' * 16,
+                        result={'appliedPhase': 'stopped'}))
+            self.assertEqual(done['receipt'], 'completed')
+            view = reg.operation_status(CONTROLLER, '11' * 16,
+                                        '22' * 16)
+            self.assertEqual(view['status'], 'completed')
+            self.assertEqual(view['result'],
+                             {'appliedPhase': 'stopped'})
+            self.assertEqual(view['step'], 'observe')
+            self.assertEqual(view['hostId'], 'host-a')
+
+    def test_post_replay_idempotent_and_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = self.placed(tmp)
+            first = reg.post_operation(
+                CONTROLLER, operation_request())
+            replay = reg.post_operation(
+                CONTROLLER, operation_request())
+            self.assertEqual(replay, first)
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.post_operation(CONTROLLER, operation_request(
+                    step='start', payload={
+                        'schemaVersion': 1, 'operationId': '11' * 16,
+                        'action': 'start', 'workloadId': 'canary',
+                        'revisionDigest': DIGEST, 'instanceId': I1,
+                        'generation': 1}))
+            self.assertEqual(ctx.exception.code, 'request-conflict')
+            # Same operationId under a different requestId conflicts.
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.post_operation(CONTROLLER, operation_request(
+                    request_id='55' * 16))
+            self.assertEqual(ctx.exception.code, 'operation-conflict')
+            # A different principal cannot replay the requestId.
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.post_operation(CONTROLLER_2, operation_request())
+            self.assertEqual(ctx.exception.code, 'request-conflict')
+
+    def test_stale_or_foreign_generation_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = make_registry(tmp)
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.post_operation(CONTROLLER, operation_request())
+            self.assertEqual(ctx.exception.code, 'generation-conflict')
+            reg.assign(CONTROLLER, assign_request(I1, 'host-a', 0,
+                                                  'a1' * 16))
+            # Generation exists but is bound to another host.
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.post_operation(CONTROLLER, operation_request(
+                    host='host-b'))
+            self.assertEqual(ctx.exception.code, 'generation-conflict')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.post_operation(CONTROLLER, operation_request(
+                    generation=2))
+            self.assertEqual(ctx.exception.code, 'generation-conflict')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.post_operation(CONTROLLER, operation_request(
+                    workload='ghost'))
+            self.assertEqual(ctx.exception.code, 'unknown-workload')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.post_operation(CONTROLLER, operation_request(
+                    host='ghost'))
+            self.assertEqual(ctx.exception.code, 'unknown-host')
+            # A superseded generation is stale once assign advances.
+            session_a = reg.open_session(
+                P_HOST_A, session_request('host-a'))['sessionId']
+            reg.observe(P_HOST_A, observation(
+                I1, 'host-a', session_a, 1, fake.now, 'stopped',
+                'inactive', True, True))
+            reg.assign(CONTROLLER, assign_request(I2, 'host-b', 1,
+                                                  'a2' * 16))
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.post_operation(CONTROLLER, operation_request(
+                    operation_id='66' * 16, request_id='77' * 16,
+                    host='host-a', generation=1))
+            self.assertEqual(ctx.exception.code, 'generation-conflict')
+
+    def test_role_and_host_enforcement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = self.placed(tmp)
+            for bad in (READER, INGRESS, P_HOST_A):
+                with self.assertRaises(registry.RegistryError) as ctx:
+                    reg.post_operation(bad, operation_request())
+                self.assertEqual(ctx.exception.status, 403)
+            reg.post_operation(CONTROLLER, operation_request())
+            # Only the owning host polls and receipts.
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.poll_operations(CONTROLLER, 'host-a', 0)
+            self.assertEqual(ctx.exception.status, 403)
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.poll_operations(P_HOST_B, 'host-a', 0)
+            self.assertEqual(ctx.exception.code, 'host-mismatch')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.operation_receipt(P_HOST_B, '11' * 16,
+                                      receipt('claimed'))
+            self.assertEqual(ctx.exception.code, 'host-mismatch')
+            # Operation status is controller-only, bound to poster.
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.operation_status(P_HOST_A, '11' * 16, '22' * 16)
+            self.assertEqual(ctx.exception.status, 403)
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.operation_status(CONTROLLER_2, '11' * 16,
+                                     '22' * 16)
+            self.assertEqual(ctx.exception.code, 'forbidden')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.operation_status(CONTROLLER, '11' * 16,
+                                     '88' * 16)
+            self.assertEqual(ctx.exception.code, 'forbidden')
+            view = reg.operation_status(CONTROLLER, '11' * 16,
+                                        '22' * 16)
+            self.assertEqual(view['status'], 'pending')
+
+    def test_receipt_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = self.placed(tmp)
+            reg.post_operation(CONTROLLER, operation_request())
+            # Terminal receipts require a prior claim.
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.operation_receipt(
+                    P_HOST_A, '11' * 16,
+                    receipt('completed', '44' * 16, result={}))
+            self.assertEqual(ctx.exception.code,
+                             'operation-not-claimed')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.operation_receipt(P_HOST_A, '99' * 16,
+                                      receipt('claimed'))
+            self.assertEqual(ctx.exception.code, 'unknown-operation')
+            reg.operation_receipt(P_HOST_A, '11' * 16,
+                                  receipt('claimed'))
+            # Identical claim replay accepted; conflicting 409.
+            self.assertEqual(reg.operation_receipt(
+                P_HOST_A, '11' * 16, receipt('claimed'))['status'],
+                'accepted')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.operation_receipt(P_HOST_A, '11' * 16,
+                                      receipt('claimed', '55' * 16))
+            self.assertEqual(ctx.exception.code, 'receipt-conflict')
+            done = receipt('completed', '44' * 16,
+                           result={'appliedPhase': 'stopped'})
+            reg.operation_receipt(P_HOST_A, '11' * 16, done)
+            self.assertEqual(reg.operation_receipt(
+                P_HOST_A, '11' * 16, done)['status'], 'accepted')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.operation_receipt(P_HOST_A, '11' * 16,
+                                      receipt('completed', '44' * 16,
+                                              result={'other': 1}))
+            self.assertEqual(ctx.exception.code, 'receipt-conflict')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.operation_receipt(P_HOST_A, '11' * 16,
+                                      receipt('failed', '66' * 16,
+                                              errorCode='x'))
+            self.assertEqual(ctx.exception.code, 'receipt-conflict')
+
+    def test_failed_receipt_visible_to_controller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = self.placed(tmp)
+            reg.post_operation(CONTROLLER, operation_request())
+            reg.operation_receipt(P_HOST_A, '11' * 16,
+                                  receipt('claimed'))
+            reg.operation_receipt(P_HOST_A, '11' * 16,
+                                  receipt('failed', '44' * 16,
+                                          errorCode='worker-retired'))
+            view = reg.operation_status(CONTROLLER, '11' * 16,
+                                        '22' * 16)
+            self.assertEqual(view['status'], 'failed')
+            self.assertEqual(view['errorCode'], 'worker-retired')
+            self.assertNotIn('result', view)
+
+    def test_operation_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = self.placed(tmp)
+            base = operation_request()
+            for mutate, code in (
+                    (lambda r: r.update(schemaVersion=1),
+                     'invalid-schemaVersion'),
+                    (lambda r: r.update(step='wipe'),
+                     'invalid-step'),
+                    (lambda r: r.update(generation=0),
+                     'invalid-generation'),
+                    (lambda r: r.update(payload='string'),
+                     'invalid-payload'),
+                    (lambda r: r.update(payload={'x' * 65: 1}),
+                     'invalid-payload'),
+                    (lambda r: r.update(payload=_deep_tree(10)),
+                     'invalid-payload')):
+                request = operation_request()
+                mutate(request)
+                with self.assertRaises(registry.RegistryError,
+                                       msg=code) as ctx:
+                    reg.post_operation(CONTROLLER, request)
+                self.assertEqual(ctx.exception.code, code)
+            with self.assertRaises(registry.RegistryError):
+                reg.post_operation(CONTROLLER, dict(base, extra=1))
+
+    def test_operations_survive_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = self.placed(tmp)
+            reg.post_operation(CONTROLLER, operation_request())
+            reg.operation_receipt(P_HOST_A, '11' * 16,
+                                  receipt('claimed'))
+            reg.close()
+            _LIVE.remove(reg)
+            reg2, _ = make_registry(tmp, epoch='epoch-2',
+                                    fake=FakeTime(1100.0, 900.0))
+            # Claimed ops are not pending; the receipt state survives.
+            self.assertEqual(
+                reg2.poll_operations(P_HOST_A, 'host-a', 0)
+                ['operations'], [])
+            view = reg2.operation_status(CONTROLLER, '11' * 16,
+                                         '22' * 16)
+            self.assertEqual(view['status'], 'claimed')
+            reg2.operation_receipt(P_HOST_A, '11' * 16,
+                                   receipt('completed', '44' * 16,
+                                           result={}))
+            view = reg2.operation_status(CONTROLLER, '11' * 16,
+                                         '22' * 16)
+            self.assertEqual(view['status'], 'completed')
+
+    def test_queue_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = self.placed(tmp)
+            for index in range(registry._OPERATION_PENDING_MAX):
+                reg.post_operation(CONTROLLER, operation_request(
+                    operation_id='{:032x}'.format(index + 1),
+                    request_id='{:032x}'.format(index + 0x1000)))
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.post_operation(CONTROLLER, operation_request(
+                    operation_id='ee' * 16, request_id='ff' * 16))
+            self.assertEqual(ctx.exception.code,
+                             'operation-queue-full')
+            listed = reg.poll_operations(P_HOST_A, 'host-a', 0)
+            self.assertEqual(len(listed['operations']),
+                             registry._OPERATION_POLL_MAX)
+            seqs = [op['seq'] for op in listed['operations']]
+            self.assertEqual(seqs, sorted(seqs))

@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -73,19 +74,33 @@ def assignment(instance_id=I1, host='host-a', generation=1):
             'generation': generation}
 
 
+def pending_operation(seq=1, operation_id='11' * 16, step='observe',
+                      generation=1, payload=None):
+    if payload is None:
+        payload = {'schemaVersion': 1, 'action': 'observe',
+                   'instanceId': I1}
+    return {'seq': seq, 'operationId': operation_id,
+            'workloadId': 'canary', 'generation': generation,
+            'step': step, 'payload': payload}
+
+
 class FakeTransport:
     """Scriptable registry transport double."""
 
     def __init__(self):
         self.calls = []
         self.posted = []
+        self.receipts = []
         self.session_count = 0
         self.session = None
         self.epoch = 'ab' * 16
         self.assignments = [assignment(I1)]
+        self.operations = []
         self.observation_responses = []
         self.session_responses = []
         self.assignments_responses = []
+        self.operations_responses = []
+        self.receipt_responses = []
         self.fail = None
 
     def request(self, method, path, payload=None):
@@ -112,7 +127,52 @@ class FakeTransport:
             return 200, {'schemaVersion': 2, 'status': 'accepted',
                          'instanceId': payload['instanceId'],
                          'sequence': payload['sequence']}
+        if path.startswith('/v2/operations?'):
+            if self.operations_responses:
+                return self.operations_responses.pop(0)
+            return 200, {'schemaVersion': 2, 'hostId': 'host-a',
+                         'operations': [dict(op)
+                                        for op in self.operations]}
+        if path.startswith('/v2/operations/') \
+                and path.endswith('/receipt'):
+            operation_id = path[len('/v2/operations/'):-len('/receipt')]
+            self.receipts.append((operation_id, dict(payload)))
+            if self.receipt_responses:
+                return self.receipt_responses.pop(0)
+            return 200, {'schemaVersion': 2, 'status': 'accepted',
+                         'operationId': operation_id,
+                         'receipt': payload['status']}
         raise AssertionError('unexpected path ' + path)
+
+
+class FakeCliRunner:
+    """Scriptable bounded-subprocess double keyed on (program, action)."""
+
+    def __init__(self, responses=None):
+        self.calls = []
+        self.responses = responses or {}
+
+    def run(self, argv, input_bytes, *, timeout):
+        request = json.loads(input_bytes.decode('utf-8'))
+        self.calls.append((list(argv), request))
+        response = self.responses.get((argv[0], request['action']))
+        if callable(response):
+            response = response(request)
+        if response is None:
+            raise AssertionError('no scripted response for ' + argv[0])
+        if isinstance(response, Exception):
+            raise response
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps(response).encode('utf-8'), b'')
+
+
+def worker_receipt(action='prepare', phase='prepared', **extra):
+    receipt = {'schemaVersion': 1, 'operationId': '11' * 16,
+               'action': action, 'workloadId': 'canary',
+               'instanceId': I1, 'generation': 1, 'hostId': 'host-a',
+               'status': 'completed', 'appliedPhase': phase}
+    receipt.update(extra)
+    return receipt
 
 
 class ReporterFixture(unittest.TestCase):
@@ -129,6 +189,8 @@ class ReporterFixture(unittest.TestCase):
         self.transport = FakeTransport()
         self.observed = {I1: observe_record(I1),
                          I2: observe_record(I2)}
+        self.executed = []
+        self.runner = FakeCliRunner()
         self.logs = []
         self._reporters = []
         self.addCleanup(self._close_all)
@@ -149,8 +211,27 @@ class ReporterFixture(unittest.TestCase):
         config.update(overrides)
         return config
 
+    def executor(self, request):
+        """Default dispatch executor: worker.execute double."""
+        self.executed.append(dict(request))
+        action = request.get('action')
+        if action == 'observe':
+            return dict(self.observed.get(
+                request['instanceId'], {'instanceId':
+                                        request['instanceId']}))
+        receipt = worker_receipt(
+            action=action,
+            phase={'freeze': 'stopped', 'thaw': 'stopped',
+                   'stop': 'stopped', 'retire': 'stopped',
+                   'start': 'running', 'prepare': 'prepared'}[action],
+            operationId=request['operationId'])
+        if request.get('captureId') is not None:
+            receipt['captureId'] = request['captureId']
+        return receipt
+
     def make_reporter(self, observer=None, prober=None,
-                      transport=None, **config_overrides):
+                      transport=None, executor=None, runner=None,
+                      **config_overrides):
         observe = observer or (lambda instance_id:
                                dict(self.observed[instance_id]))
         instance = reporter.Reporter(
@@ -158,6 +239,9 @@ class ReporterFixture(unittest.TestCase):
             transport=transport or self.transport,
             observer=observe,
             prober=prober or (lambda address, port: True),
+            executor=executor if executor is not None
+            else self.executor,
+            runner=runner or self.runner,
             clock=lambda: 1000.0, log=self.logs.append,
             rand=lambda: 0.5)
         self._reporters.append(instance)
@@ -205,13 +289,14 @@ class CycleTests(ReporterFixture):
         self.assertEqual(calls[0][1], '/v2/hosts/session')
         self.assertEqual([c[1] for c in calls[1:]],
                          ['/v2/assignments', '/v2/observations',
-                          '/v2/observations'])
-        sequences = [c[2]['sequence'] for c in calls[2:]]
+                          '/v2/observations',
+                          '/v2/operations?host=host-a&after=0'])
+        sequences = [c[2]['sequence'] for c in calls[2:4]]
         self.assertEqual(sequences, [1, 2])
         self.assertTrue(all(c[2]['sessionId'] == self.transport.session
-                            for c in calls[2:]))
+                            for c in calls[2:4]))
         self.assertTrue(all(c[2]['readyServices'] == ['web']
-                            for c in calls[2:]))
+                            for c in calls[2:4]))
 
     def test_sequence_resume_across_restart(self):
         first = self.make_reporter()
@@ -360,6 +445,257 @@ class CycleTests(ReporterFixture):
             self.assertLessEqual(instance._backoff(failures), 60)
 
 
+class DispatchTests(ReporterFixture):
+    """Pull-model operation dispatch: claim, execute, receipt."""
+
+    def worker_op(self, action='prepare', operation_id='11' * 16,
+                  instance_id=I1, **extra):
+        payload = {'schemaVersion': 1, 'operationId': operation_id,
+                   'action': action, 'workloadId': 'canary',
+                   'revisionDigest': DIGEST, 'instanceId': instance_id,
+                   'generation': 1}
+        payload.update(extra)
+        return pending_operation(step=action, operation_id=operation_id,
+                                 payload=payload)
+
+    def receipts(self, operation_id='11' * 16):
+        return [body for op_id, body in self.transport.receipts
+                if op_id == operation_id]
+
+    def journal_path(self, operation_id='11' * 16):
+        return os.path.join(self.state_dir, 'dispatch',
+                            operation_id + '.json')
+
+    def test_dispatch_observe_completes(self):
+        self.transport.operations = [pending_operation()]
+        instance = self.make_reporter()
+        instance.run_once()
+        receipts = self.receipts()
+        self.assertEqual([r['status'] for r in receipts],
+                         ['claimed', 'completed'])
+        self.assertEqual(receipts[1]['result']['phase'], 'running')
+        # Deterministic receipt ids per operation.
+        self.assertEqual(receipts[0]['requestId'],
+                         instance._receipt_id('11' * 16, 'claim'))
+        self.assertEqual(receipts[1]['requestId'],
+                         instance._receipt_id('11' * 16, 'receipt'))
+        self.assertFalse(os.path.exists(self.journal_path()))
+        self.assertEqual(len(self.executed), 1)
+
+    def test_dispatch_worker_step(self):
+        self.transport.operations = [self.worker_op(
+            'freeze', captureId='cc' * 16)]
+        instance = self.make_reporter()
+        instance.run_once()
+        self.assertEqual(self.executed[0]['action'], 'freeze')
+        self.assertEqual(self.executed[0]['operationId'], '11' * 16)
+        receipts = self.receipts()
+        self.assertEqual(receipts[1]['status'], 'completed')
+        self.assertEqual(receipts[1]['result']['captureId'],
+                         'cc' * 16)
+        self.assertEqual(receipts[1]['result']['appliedPhase'],
+                         'stopped')
+
+    def test_dispatch_refuses_foreign_instance(self):
+        self.transport.operations = [self.worker_op(
+            'stop', instance_id=I2)]
+        instance = self.make_reporter()
+        instance.run_once()
+        receipts = self.receipts()
+        self.assertEqual([r['status'] for r in receipts],
+                         ['claimed', 'failed'])
+        self.assertEqual(receipts[1]['errorCode'],
+                         'operation-not-held')
+        self.assertEqual(self.executed, [])
+
+    def test_dispatch_refuses_stale_generation(self):
+        self.transport.operations = [self.worker_op(
+            'stop', generation=5)]
+        self.transport.operations[0]['generation'] = 5
+        self.transport.operations[0]['payload']['generation'] = 5
+        instance = self.make_reporter()
+        instance.run_once()
+        receipts = self.receipts()
+        self.assertEqual(receipts[1]['status'], 'failed')
+        self.assertEqual(receipts[1]['errorCode'],
+                         'operation-not-held')
+
+    def test_dispatch_refuses_invalid_payload(self):
+        bad = pending_operation(step='prepare',
+                                payload={'schemaVersion': 1})
+        self.transport.operations = [bad]
+        instance = self.make_reporter()
+        instance.run_once()
+        self.assertEqual(self.receipts()[1]['errorCode'],
+                         'operation-invalid')
+        instance.close()
+        self._reporters.remove(instance)
+        # Payload operationId must equal the registry operationId.
+        mismatch = self.worker_op('prepare', operation_id='99' * 16)
+        mismatch['payload']['operationId'] = '77' * 16
+        self.transport.operations = [mismatch]
+        second = self.make_reporter()
+        second.run_once()
+        self.assertEqual(self.receipts('99' * 16)[1]['errorCode'],
+                         'operation-not-held')
+        self.assertEqual(self.executed, [])
+
+    def test_dispatch_claim_conflict_drops(self):
+        self.transport.operations = [pending_operation()]
+        self.transport.receipt_responses = [
+            (409, {'schemaVersion': 2, 'status': 'error',
+                   'error': 'receipt-conflict'})]
+        instance = self.make_reporter()
+        instance.run_once()
+        self.assertEqual(len(self.transport.receipts), 1)
+        self.assertEqual(self.executed, [])
+        self.assertFalse(os.path.exists(self.journal_path()))
+        events = [e['event'] for e in self.logs]
+        self.assertIn('dispatch-conflict', events)
+
+    def test_dispatch_crash_resumes_journal(self):
+        # Simulate crash after claim: durable entry in 'claimed'.
+        os.mkdir(os.path.join(self.state_dir, 'dispatch'), 0o700)
+        entry = {'schemaVersion': 1, 'operationId': '11' * 16,
+                 'seq': 1, 'workloadId': 'canary', 'generation': 1,
+                 'step': 'observe',
+                 'payload': {'schemaVersion': 1, 'action': 'observe',
+                             'instanceId': I1},
+                 'claimRequestId': 'aa' * 16,
+                 'receiptRequestId': 'bb' * 16, 'phase': 'claimed',
+                 'result': None, 'errorCode': None}
+        statefiles.ensure_private_file(self.journal_path())
+        statefiles.write_json(self.journal_path(), entry)
+        instance = self.make_reporter()
+        instance.run_once()
+        # No re-claim: the journal skips straight to execute+receipt.
+        self.assertEqual([r['status'] for r in self.receipts()],
+                         ['completed'])
+        self.assertFalse(os.path.exists(self.journal_path()))
+        instance.close()
+        self._reporters.remove(instance)
+        # A 'claiming' entry re-posts the identical claim request.
+        entry['operationId'] = '22' * 16
+        entry['phase'] = 'claiming'
+        self.transport.operations = []
+        statefiles.ensure_private_file(self.journal_path('22' * 16))
+        statefiles.write_json(self.journal_path('22' * 16), entry)
+        third = self.make_reporter()
+        third.run_once()
+        self.assertEqual(
+            [r['status'] for r in self.receipts('22' * 16)],
+            ['claimed', 'completed'])
+
+    def test_dispatch_worker_failed_maps_error(self):
+        def executor(request):
+            receipt = worker_receipt(action='retire')
+            receipt.update(status='failed', error='instance-retired')
+            return receipt
+        self.transport.operations = [self.worker_op('retire')]
+        instance = self.make_reporter(executor=executor)
+        instance.run_once()
+        self.assertEqual(self.receipts()[1]['errorCode'],
+                         'worker-instance-retired')
+
+    def test_dispatch_worker_uncertain_retries(self):
+        def executor(request):
+            receipt = worker_receipt(action='stop')
+            receipt.update(status='uncertain')
+            return receipt
+        self.transport.operations = [self.worker_op('stop')]
+        instance = self.make_reporter(executor=executor)
+        with self.assertRaises(reporter.ReporterError) as ctx:
+            instance.run_once()
+        self.assertEqual(ctx.exception.code, 'worker-uncertain')
+        # Claim survives: journal stays at 'claimed', no final receipt.
+        journal = statefiles.read_json(self.journal_path(), 16384)
+        self.assertEqual(journal['phase'], 'claimed')
+        self.assertEqual(len(self.receipts()), 1)
+
+    def test_dispatch_restore_cli(self):
+        stage = {'schemaVersion': 1, 'action': 'stage',
+                 'restoreId': 'ee' * 16, 'repositoryId': 'repo-a',
+                 'snapshotId': 'f0' * 32,
+                 'target': {'workloadId': 'canary',
+                            'revisionDigest': DIGEST,
+                            'instanceId': I1, 'generation': 1,
+                            'slotId': 's0'}}
+        self.transport.operations = [pending_operation(
+            step='restore-stage', payload=stage)]
+        self.runner.responses[('/nix/nexus-restore', 'stage')] = {
+            'schemaVersion': 1, 'status': 'completed',
+            'action': 'stage', 'restoreId': 'ee' * 16}
+        instance = self.make_reporter(
+            restoreProgram='/nix/nexus-restore',
+            restoreConfigFile='/etc/nexus/restore.json')
+        instance.run_once()
+        argv, request = self.runner.calls[0]
+        self.assertEqual(argv, ['/nix/nexus-restore', '--config',
+                                '/etc/nexus/restore.json', 'execute'])
+        self.assertEqual(request['target']['slotId'], 's0')
+        self.assertEqual(self.receipts()[1]['status'], 'completed')
+
+    def test_dispatch_cli_unavailable_refuses(self):
+        commit = {'schemaVersion': 1, 'action': 'commit',
+                  'restoreId': 'ee' * 16}
+        self.transport.operations = [pending_operation(
+            step='restore-commit', payload=commit)]
+        instance = self.make_reporter()
+        instance.run_once()
+        self.assertEqual(self.receipts()[1]['errorCode'],
+                         'dispatch-unavailable')
+
+    def test_dispatch_capture_runs_both_clis(self):
+        capture = {'schemaVersion': 1, 'action': 'capture',
+                   'captureId': 'cc' * 16, 'workloadId': 'canary',
+                   'revisionDigest': DIGEST, 'instanceId': I1,
+                   'generation': 1}
+        upload = {'schemaVersion': 1, 'action': 'upload',
+                  'captureId': 'cc' * 16, 'repositoryId': 'repo-a'}
+        self.transport.operations = [pending_operation(
+            step='capture',
+            payload={'capture': capture, 'upload': upload})]
+        self.runner.responses[('/nix/nexus-backup', 'capture')] = {
+            'schemaVersion': 1, 'status': 'completed',
+            'action': 'capture', 'captureId': 'cc' * 16}
+        self.runner.responses[('/nix/nexus-backup', 'upload')] = {
+            'schemaVersion': 1, 'status': 'completed',
+            'action': 'upload', 'captureId': 'cc' * 16,
+            'record': {'snapshotId': 'f0' * 32,
+                       'repositoryId': 'repo-a'},
+            'verifiedAt': 1005}
+        instance = self.make_reporter(
+            backupProgram='/nix/nexus-backup',
+            backupConfigFile='/etc/nexus/backup.json')
+        instance.run_once()
+        self.assertEqual([c[1]['action'] for c in self.runner.calls],
+                         ['capture', 'upload'])
+        result = self.receipts()[1]['result']
+        self.assertEqual(result['snapshotId'], 'f0' * 32)
+        self.assertEqual(result['verifiedAt'], 1005)
+
+    def test_dispatch_operations_response_invalid(self):
+        self.transport.operations_responses = [
+            (200, {'schemaVersion': 2, 'hostId': 'host-a',
+                   'operations': [{'operationId': 'zz'}]})]
+        instance = self.make_reporter()
+        with self.assertRaises(reporter.ReporterError) as ctx:
+            instance.run_once()
+        self.assertEqual(ctx.exception.code,
+                         'registry-response-invalid')
+
+    def test_dispatch_corrupt_journal_blocks(self):
+        os.mkdir(os.path.join(self.state_dir, 'dispatch'), 0o700)
+        statefiles.ensure_private_file(self.journal_path())
+        statefiles.write_json(self.journal_path(),
+                              {'schemaVersion': 1})
+        instance = self.make_reporter()
+        with self.assertRaises(reporter.ReporterError) as ctx:
+            instance.run_once()
+        self.assertEqual(ctx.exception.code,
+                         'dispatch-journal-invalid')
+
+
 class LoggingTests(ReporterFixture):
     def test_no_secrets_or_bodies_in_logs(self):
         self.transport.fail = ConnectionError(
@@ -501,7 +837,7 @@ class TlsReporterTests(unittest.TestCase):
         context.load_cert_chain(self.host_crt, self.host_key)
         return context
 
-    def make_reporter(self, observed=None):
+    def make_reporter(self, observed=None, executor=None):
         config = {'schemaVersion': 2, 'hostId': 'host-a',
                   'registryUrl': 'https://127.0.0.1:{}'.format(
                       self.port),
@@ -517,8 +853,48 @@ class TlsReporterTests(unittest.TestCase):
             config, transport=transport,
             observer=observed or (lambda instance_id: dict(
                 observe_record(instance_id))),
+            executor=executor,
             prober=lambda a, p: True)
         return self.reporter_instance
+
+    def test_live_dispatch_executes_and_receipts(self):
+        """Real mTLS: controller posts an op, the host reporter claims,
+        executes and posts a receipt the controller can read back."""
+        controller_p = registry.Principal('test', 'controller')
+        self.reg.assign(controller_p, test_registry.assign_request(
+            I1, 'host-a', 0, 'a1' * 16))
+        self.reg.post_operation(controller_p,
+                                test_registry.operation_request())
+        executed = []
+        instance = self.make_reporter(
+            executor=lambda request: executed.append(request)
+            or {'bindingCurrent': True, 'slotId': 's0',
+                'phase': 'prepared'})
+        instance.run_once()
+        self.assertEqual(len(executed), 1)
+        view = self.reg.operation_status(controller_p, '11' * 16,
+                                         '22' * 16)
+        self.assertEqual(view['status'], 'completed')
+        self.assertEqual(view['result']['slotId'], 's0')
+        # Queue drained; nothing re-executes next cycle.
+        instance.run_once()
+        self.assertEqual(len(executed), 1)
+
+    def test_live_dispatch_foreign_receipt_rejected(self):
+        """The registry refuses receipts for operations addressed to
+        another host — enforced by the certificate role binding."""
+        controller_p = registry.Principal('test', 'controller')
+        self.reg.assign(controller_p, test_registry.assign_request(
+            I1, 'host-b', 0, 'a1' * 16))
+        self.reg.post_operation(
+            controller_p,
+            test_registry.operation_request(host='host-b'))
+        instance = self.make_reporter()
+        # host-a's queue is empty — nothing is claimed or run.
+        instance.run_once()
+        view = self.reg.operation_status(controller_p, '11' * 16,
+                                         '22' * 16)
+        self.assertEqual(view['status'], 'pending')
 
     def test_live_session_observe_and_routes(self):
         self.reg.assign(

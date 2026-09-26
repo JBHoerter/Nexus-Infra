@@ -109,19 +109,88 @@ def action_request(action, operation_id=OP1):
 
 
 class FakeRegistryTransport:
-    """Scriptable /v2/state + placement endpoint double."""
+    """Scriptable /v2/state + placement + operation-queue double.
+
+    ``operations`` models the registry's durable queue: POST accepts
+    (idempotent on requestId), GET returns the view. ``receipt_fn``,
+    when set, is invoked at POST time to simulate the remote reporter's
+    receipt; ``complete_on_read`` additionally completes rows lazily on
+    GET so a test can let an op complete between execute calls.
+    """
 
     def __init__(self, state_fn):
         self.state_fn = state_fn
         self.requests = []
         self.assigned = False
         self.post_failures = {}
+        self.operations = {}
+        self.receipt_fn = None
+        self.complete_on_read = False
+
+    def completed_steps(self):
+        return {row['step'] for row in self.operations.values()
+                if row['status'] == 'completed'}
+
+    def operation_rows(self, step):
+        return [row for row in self.operations.values()
+                if row['step'] == step]
+
+    def fail_step(self, step, error_code):
+        for row in self.operation_rows(step):
+            if row['status'] in ('pending', 'claimed'):
+                row['status'] = 'failed'
+                row['errorCode'] = error_code
 
     def request(self, method, path, payload=None):
         self.requests.append((method, path,
                               copy.deepcopy(payload)))
         if method == 'GET' and path == '/v2/state':
             return 200, self.state_fn()
+        if method == 'POST' and path == '/v2/operations':
+            failure = self.post_failures.get('operations')
+            if failure is not None:
+                return failure
+            operation_id = payload['operationId']
+            row = self.operations.get(operation_id)
+            if row is None:
+                row = {'operationId': operation_id,
+                       'requestId': payload['requestId'],
+                       'workloadId': payload['workloadId'],
+                       'hostId': payload['hostId'],
+                       'generation': payload['generation'],
+                       'step': payload['step'],
+                       'payload': copy.deepcopy(payload['payload']),
+                       'status': 'pending',
+                       'result': None, 'errorCode': None}
+                self.operations[operation_id] = row
+                if self.receipt_fn is not None:
+                    self.receipt_fn(row)
+            return 200, {'schemaVersion': 2, 'status': 'accepted',
+                         'operationId': operation_id,
+                         'requestId': payload['requestId']}
+        if method == 'GET' and path.startswith('/v2/operations/'):
+            suffix = path[len('/v2/operations/'):]
+            operation_id, _, query = suffix.partition('?')
+            request_id = query.partition('requestId=')[2]
+            row = self.operations.get(operation_id)
+            if row is None or row['requestId'] != request_id:
+                return 404, {'schemaVersion': 2, 'status': 'error',
+                             'error': 'operation-missing'}
+            if self.complete_on_read and row['status'] == 'pending' \
+                    and self.receipt_fn is not None:
+                self.receipt_fn(row)
+            body = {'schemaVersion': 2,
+                    'operationId': row['operationId'],
+                    'requestId': row['requestId'],
+                    'workloadId': row['workloadId'],
+                    'hostId': row['hostId'],
+                    'generation': row['generation'],
+                    'step': row['step'], 'status': row['status']}
+            if row['status'] == 'completed':
+                body['result'] = copy.deepcopy(row['result'])
+            if row['status'] == 'failed':
+                body['errorCode'] = row['errorCode']
+            return 200, body
         if method == 'POST' and path == '/v2/placements/assign':
             failure = self.post_failures.get('assign')
             if failure is not None:
@@ -232,6 +301,39 @@ def restore_response(action):
     return respond
 
 
+def dispatch_receipt(slot='s9'):
+    """A ``receipt_fn`` completing every queued op the way the remote
+    reporter's receipts look after real local execution."""
+    def complete(row):
+        step = row['step']
+        payload = row['payload']
+        if step in ('freeze', 'thaw'):
+            result = {'appliedPhase': 'stopped',
+                      'captureId': payload['captureId']}
+        elif step in ('stop', 'retire'):
+            result = {'appliedPhase': 'stopped'}
+        elif step == 'prepare':
+            result = {'appliedPhase': 'prepared'}
+        elif step == 'start':
+            result = {'appliedPhase': 'running'}
+        elif step == 'observe':
+            result = {'bindingCurrent': True, 'slotId': slot,
+                      'phase': 'prepared', 'unitActiveState': 'inactive',
+                      'retired': False}
+        elif step == 'capture':
+            result = {'snapshotId': SNAPSHOT,
+                      'repositoryId':
+                          payload['upload']['repositoryId'],
+                      'verifiedAt': 1005}
+        else:  # restore-stage / restore-commit
+            result = {'status': 'completed',
+                      'restoreId': payload['restoreId'],
+                      'action': payload['action']}
+        row['status'] = 'completed'
+        row['result'] = result
+    return complete
+
+
 class ControllerFixture(unittest.TestCase):
 
     def setUp(self):
@@ -319,7 +421,8 @@ class ControllerFixture(unittest.TestCase):
             runner=kwargs.pop('runner', self.runner),
             worker_factory=lambda config: kwargs.pop(
                 'fake_worker', self.fake_worker),
-            clock=lambda: 1000.0)
+            clock=lambda: 1000.0,
+            sleeper=kwargs.pop('sleeper', lambda seconds: None))
         self.controllers.append(instance)
         return instance
 
@@ -552,13 +655,20 @@ class ExecuteLocalTests(ControllerFixture):
         job = self.read_job()
         self.assertEqual(job['phase'], 'validate')
 
-    def test_source_not_local(self):
+    def test_source_remote_no_longer_rejected(self):
+        # The old 'source-not-local' gate is gone: a remote source is
+        # dispatched through the operation queue instead.
         self.stage[0] = workload_row(I1, 'host-b', 1)
         instance = self.make_controller()
         plan = instance.execute(plan_request(toHostId='host-a'))
         self.assertEqual(plan['status'], 'completed')
-        self.expect_blocked(instance.execute(action_request('execute')),
-                            'source-not-local')
+        steps = {entry['step']: entry['disposition']
+                 for entry in plan['operation']['plan']['steps']}
+        self.assertEqual(steps['freeze'], 'remote')
+        self.assertEqual(steps['capture'], 'remote')
+        self.assertEqual(steps['thaw'], 'remote')
+        self.assertEqual(steps['retire-source'], 'remote')
+        self.assertEqual(steps['install-target'], 'local')
 
     def test_worker_failure_is_typed(self):
         self.fake_worker.failures['freeze'] = 'phase-conflict'
@@ -648,7 +758,9 @@ class RemoteTargetTests(ControllerFixture):
         self.remote_stage = 'initial'
         self.transport.state_fn = self._state()
 
-    def test_remote_install_deferred_then_verified(self):
+    def test_remote_install_deferred_then_completed(self):
+        """Remote install defers while ops are pending; once the host
+        reporter posts receipts, execute resumes and finishes."""
         instance = self.make_controller()
         self.assertEqual(instance.execute(plan_request())['status'],
                          'completed')
@@ -657,28 +769,116 @@ class RemoteTargetTests(ControllerFixture):
         entry = next(e for e in response['operation']['checkpoints']
                      if e['step'] == 'install-target')
         self.assertEqual(entry['state'], 'deferred')
-        instruction = entry['detail']['instruction']
-        self.assertEqual(entry['detail']['disposition'],
-                         'remote-deferred')
-        self.assertEqual(instruction['prepare']['action'], 'prepare')
-        self.assertEqual(instruction['prepare']['instanceId'],
+        detail = entry['detail']
+        self.assertEqual(detail['disposition'], 'remote-dispatched')
+        self.assertEqual(detail['step'], 'prepare')
+        self.assertEqual(detail['hostId'], 'host-b')
+        self.assertEqual(detail['operationStatus'], 'pending')
+        self.assertEqual(detail['operationId'],
+                         controller._derive(OP1, 'prepare'))
+        self.assertEqual(detail['requestId'],
+                         controller._derive(OP1, 'post:prepare'))
+        self.assertEqual(detail['instruction']['action'], 'prepare')
+        self.assertEqual(detail['instruction']['instanceId'],
                          self.new_instance)
-        self.assertEqual(instruction['restoreStage']['snapshotId'],
-                         SNAPSHOT)
-        self.assertEqual(instruction['restoreCommit']['restoreId'],
-                         controller._derive(OP1, 'restore'))
-        self.assertEqual(instruction['start']['generation'], 2)
-        # Remote operator completes; fresh registry evidence resumes.
-        self.remote_stage = 'assigned-prepared'
-        response = instance.execute(action_request('execute'))
-        self.assertEqual(response['status'], 'deferred')
-        self.assertEqual(response['operation']['phase'], 'await-ready')
+        # Re-execute replays the identical POST (same requestId and
+        # operationId — the queue stays at one prepare row).
+        again = instance.execute(action_request('execute'))
+        self.assertEqual(again['status'], 'deferred')
+        self.assertEqual(len(self.transport.operation_rows('prepare')),
+                         1)
+        # Host reporter completes queued ops; the move proceeds.
+        self.transport.receipt_fn = dispatch_receipt(slot='s9')
+        self.transport.complete_on_read = True
         self.remote_stage = 'running'
         final = instance.execute(action_request('execute'))
         self.assertEqual(final['status'], 'completed', msg=final)
-        steps = [e['step'] for e in
-                 final['operation']['checkpoints']]
+        operation = final['operation']
+        self.assertEqual(operation['toSlotId'], 's9')
+        install = next(e for e in operation['checkpoints']
+                       if e['step'] == 'install-target')
+        self.assertEqual(install['state'], 'completed')
+        self.assertEqual(install['detail'],
+                         {'disposition': 'remote', 'slotId': 's9'})
+        steps = [e['step'] for e in operation['checkpoints']]
         self.assertEqual(steps, list(controller._STEP_ORDER))
+        # All five install ops were posted to host-b at generation 2.
+        posted = {(row['step'], row['hostId'], row['generation'])
+                  for row in self.transport.operations.values()}
+        for step in ('prepare', 'observe', 'restore-stage',
+                     'restore-commit', 'start'):
+            self.assertIn((step, 'host-b', 2), posted)
+        # The dispatched restore stage carried the allocated slot.
+        stage = self.transport.operation_rows('restore-stage')[0]
+        self.assertEqual(stage['payload']['target']['slotId'], 's9')
+        self.assertEqual(stage['payload']['snapshotId'], SNAPSHOT)
+        commit = self.transport.operation_rows('restore-commit')[0]
+        self.assertEqual(commit['payload']['restoreId'],
+                         controller._derive(OP1, 'restore'))
+
+    def test_remote_install_poll_is_bounded(self):
+        """A pending op is polled exactly _DISPATCH_POLLS times before
+        the step journals 'deferred'; the sleeper bounds the wait."""
+        slept = []
+        instance = self.make_controller(
+            sleeper=lambda seconds: slept.append(seconds))
+        instance.execute(plan_request())
+        response = instance.execute(action_request('execute'))
+        self.assertEqual(response['status'], 'deferred')
+        gets = [path for _m, path, _p in self.transport.requests
+                if path.startswith('/v2/operations/')
+                and 'requestId=' in path]
+        self.assertEqual(len(gets), controller._DISPATCH_POLLS)
+        self.assertEqual(len(slept), controller._DISPATCH_POLLS - 1)
+
+    def test_remote_receipt_failed_is_typed(self):
+        instance = self.make_controller()
+        instance.execute(plan_request())
+
+        def fail_prepare(row):
+            if row['step'] == 'prepare':
+                row['status'] = 'failed'
+                row['errorCode'] = 'worker-unknown-instance'
+        self.transport.receipt_fn = fail_prepare
+        self.transport.complete_on_read = True
+        self.expect_blocked(instance.execute(action_request('execute')),
+                            'remote-worker-unknown-instance')
+        job = self.read_job()
+        self.assertEqual(job['phase'], 'install-target')
+
+    def test_remote_receipt_invalid_result(self):
+        instance = self.make_controller()
+        instance.execute(plan_request())
+
+        def bad_observe(row):
+            if row['step'] == 'observe':
+                row['status'] = 'completed'
+                row['result'] = {'bindingCurrent': False,
+                                 'slotId': 's9'}
+            elif row['step'] == 'prepare':
+                row['status'] = 'completed'
+                row['result'] = {'appliedPhase': 'prepared'}
+        self.transport.receipt_fn = bad_observe
+        self.transport.complete_on_read = True
+        self.expect_blocked(instance.execute(action_request('execute')),
+                            'remote-receipt-invalid')
+
+    def test_remote_observe_slot_mismatch(self):
+        instance = self.make_controller()
+        instance.execute(plan_request(toSlotId='s0'))
+        self.transport.receipt_fn = dispatch_receipt(slot='s9')
+        self.transport.complete_on_read = True
+        self.expect_blocked(instance.execute(action_request('execute')),
+                            'slot-mismatch')
+
+    def test_remote_operation_post_failure(self):
+        instance = self.make_controller()
+        instance.execute(plan_request())
+        self.transport.post_failures['operations'] = (
+            503, {'schemaVersion': 2, 'status': 'error',
+                  'error': 'unavailable'})
+        self.expect_blocked(instance.execute(action_request('execute')),
+                            'registry-unavailable')
 
     def test_validate_requires_target_session_evidence(self):
         # Remove host-b liveness: no fresh observation on target host.
@@ -688,6 +888,157 @@ class RemoteTargetTests(ControllerFixture):
         instance.execute(plan_request())
         self.expect_blocked(instance.execute(action_request('execute')),
                             'target-session-unproven')
+
+
+class RemoteSourceTests(ControllerFixture):
+    """Cross-host move with the SOURCE remote: freeze/capture/thaw/
+    retire are dispatched to host-b through the operation queue."""
+
+    def _state(self):
+        def state_fn():
+            retired = 'retire' in self.transport.completed_steps()
+            if self.transport.assigned:
+                rows = [workload_row(
+                    self.new_instance, 'host-a', 2, published=False,
+                    observed_state='running',
+                    obs=observation(self.new_instance, 'host-a',
+                                    generation=2))]
+            else:
+                rows = [workload_row(
+                    I1, 'host-b', 1,
+                    observed_state='retired' if retired else 'running',
+                    obs=observation(
+                        I1, 'host-b',
+                        phase='stopped' if retired else 'running',
+                        unit='inactive' if retired else 'active',
+                        drained=retired, retired=retired,
+                        ready=() if retired else ('web',)))]
+            # Local-host liveness proof for validate.
+            rows.append(workload_row(
+                I2, 'host-a', 4, workload_id='other',
+                obs={'schemaVersion': 2, 'hostId': 'host-a',
+                     'sessionId': 'cc' * 16, 'sequence': 2,
+                     'instanceId': I2, 'workloadId': 'other',
+                     'revisionDigest': DIGEST, 'generation': 4,
+                     'observedAt': 1000, 'phase': 'running',
+                     'unitActiveState': 'active', 'unitDrained': False,
+                     'retired': False,
+                     'endpointAddress': '192.168.140.9',
+                     'readyServices': [], 'receivedAt': 1000}))
+            return state_body(*rows)
+        return state_fn
+
+    def setUp(self):
+        super().setUp()
+        self.stage = [workload_row(I1, 'host-b', 1)]
+        self.transport.state_fn = self._state()
+
+    def test_remote_source_full_move(self):
+        """End-to-end: remote source ops execute via receipts, the
+        local install then completes the move."""
+        self.transport.receipt_fn = dispatch_receipt()
+        self.transport.complete_on_read = True
+        instance = self.make_controller()
+        plan = instance.execute(plan_request(toHostId='host-a'))
+        self.assertEqual(plan['status'], 'completed')
+        response = instance.execute(action_request('execute'))
+        self.assertEqual(response['status'], 'completed', msg=response)
+        operation = response['operation']
+        self.assertEqual(operation['phase'], 'completed')
+        self.assertEqual(operation['snapshotId'], SNAPSHOT)
+        # Source-side ops went to host-b at generation 1 with the
+        # derived worker operationIds as both payload and queue id.
+        posted = {row['step']: row
+                  for row in self.transport.operations.values()}
+        for step in ('freeze', 'capture', 'thaw', 'retire'):
+            row = posted[step]
+            self.assertEqual(row['hostId'], 'host-b')
+            self.assertEqual(row['generation'], 1)
+            self.assertEqual(row['status'], 'completed')
+        self.assertEqual(posted['freeze']['payload']['operationId'],
+                         posted['freeze']['operationId'])
+        self.assertEqual(posted['freeze']['payload']['captureId'],
+                         self.capture_id)
+        capture = posted['capture']['payload']
+        self.assertEqual(capture['capture']['captureId'],
+                         self.capture_id)
+        self.assertEqual(capture['capture']['instanceId'], I1)
+        self.assertEqual(capture['upload']['repositoryId'], 'repo-a')
+        # The retire checkpoint carries the remote disposition.
+        retire = next(e for e in operation['checkpoints']
+                      if e['step'] == 'retire-source')
+        self.assertEqual(retire['state'], 'completed')
+        self.assertEqual(retire['detail']['appliedPhase'], 'stopped')
+        # Local install ran the local worker for the new instance.
+        actions = [r['action'] for r in self.fake_worker.requests]
+        self.assertEqual(actions, ['prepare', 'observe', 'start'])
+        self.assertEqual(self.fake_worker.requests[0]['instanceId'],
+                         self.new_instance)
+
+    def test_remote_source_deferred_until_receipt(self):
+        """Pending remote source ops keep execute deferred; receipts
+        unblock the next call without re-posting."""
+        instance = self.make_controller()
+        instance.execute(plan_request(toHostId='host-a'))
+        response = instance.execute(action_request('execute'))
+        self.assertEqual(response['status'], 'deferred')
+        freeze = next(e for e in response['operation']['checkpoints']
+                      if e['step'] == 'freeze')
+        self.assertEqual(freeze['state'], 'deferred')
+        self.assertEqual(freeze['detail']['disposition'],
+                         'remote-dispatched')
+        self.assertEqual(freeze['detail']['hostId'], 'host-b')
+        posts = [p for m, p, _pl in self.transport.requests
+                 if m == 'POST' and p == '/v2/operations']
+        self.assertEqual(len(posts), 1)
+        # Replay while still pending: same op row, no duplicate.
+        again = instance.execute(action_request('execute'))
+        self.assertEqual(again['status'], 'deferred')
+        self.assertEqual(len(posts) + 1,
+                         len([p for m, p, _pl in
+                              self.transport.requests
+                              if m == 'POST'
+                              and p == '/v2/operations']))
+        self.assertEqual(len(self.transport.operations), 1)
+        # Complete everything; the whole move finishes in one call.
+        self.transport.receipt_fn = dispatch_receipt()
+        self.transport.complete_on_read = True
+        final = instance.execute(action_request('execute'))
+        self.assertEqual(final['status'], 'completed', msg=final)
+
+    def test_remote_source_receipt_failure(self):
+        instance = self.make_controller()
+        instance.execute(plan_request(toHostId='host-a'))
+
+        def fail_freeze(row):
+            if row['step'] == 'freeze':
+                row['status'] = 'failed'
+                row['errorCode'] = 'worker-phase-conflict'
+        self.transport.receipt_fn = fail_freeze
+        self.transport.complete_on_read = True
+        self.expect_blocked(instance.execute(action_request('execute')),
+                            'remote-worker-phase-conflict')
+        job = self.read_job()
+        self.assertEqual(job['phase'], 'freeze')
+
+    def test_remote_capture_missing_snapshot(self):
+        instance = self.make_controller()
+        instance.execute(plan_request(toHostId='host-a'))
+
+        def bad_capture(row):
+            if row['step'] == 'freeze':
+                row['status'] = 'completed'
+                row['result'] = {'appliedPhase': 'stopped',
+                                 'captureId':
+                                     row['payload']['captureId']}
+            elif row['step'] == 'capture':
+                row['status'] = 'completed'
+                # Missing snapshotId.
+                row['result'] = {'repositoryId': 'repo-a'}
+        self.transport.receipt_fn = bad_capture
+        self.transport.complete_on_read = True
+        self.expect_blocked(instance.execute(action_request('execute')),
+                            'remote-receipt-invalid')
 
 
 class AbortTests(ControllerFixture):

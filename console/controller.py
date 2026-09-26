@@ -37,17 +37,17 @@ instance shows fresh retired+drained evidence, so ``retire-source``
 must precede ``assign``. That ordering is strictly safer — the source
 can never run again once retired, so no overlap is possible.
 
-M5 REMOTE LIMITATION: this milestone has no control channel to remote
-workers (registry_api exposes no operations/dispatch surface). Steps
-whose host is not the local host are recorded as ``remote-deferred``
-checkpoints carrying the exact bounded request payloads a remote
-operator (or a future dispatcher) must run; the controller then treats
-fresh registry observations as the completion evidence. Execute is only
-permitted when the SOURCE is local: a remote freeze/capture cannot be
-verified — no registry field carries capture receipts — so ``plan``
-marks those steps remote and ``execute`` fails ``source-not-local``.
-Every remote dependence is an explicit verified-plan record, never a
-silent no-op.
+M5 REMOTE DISPATCH: steps whose host is not local are executed through
+the registry's pull-model operation queue. The controller POSTs a
+bounded operation (requestId replay-safe, bound to the current
+placement generation and its holding host), and the target host's
+reporter claims it, executes the worker/backup/restore request locally
+and posts a first-wins receipt. The controller re-reads the operation
+status on each ``execute`` call: pending/claimed stays ``deferred``
+(carrying the exact instruction for a manual fallback), ``completed``
+advances the phase machine, ``failed`` is a typed blocked error. A dead
+host can never complete a move — claimed-but-silent operations defer
+forever; nothing is silently skipped.
 """
 
 import argparse
@@ -98,6 +98,10 @@ _MAX_BODY = 65536
 _CLI_MAX_OUTPUT = 1024 * 1024
 _CLI_TIMEOUT = 120
 _BULK_TIMEOUT = 3600
+# Bounded receipt polling inside one execute call: at most this many
+# status reads, this far apart, before the step journals 'deferred'.
+_DISPATCH_POLLS = 6
+_DISPATCH_POLL_DELAY = 2.0
 _HEX32_RE = worker._HEX32_RE
 _HEX64_RE = re.compile(r'[0-9a-f]{64}')
 _HOSTNAME_RE = re.compile(
@@ -140,6 +144,9 @@ _OBSERVED_STATES = ('unknown', 'stale', 'lost', 'running', 'stopped',
 _OBSERVATION_FIELDS = registry._OBSERVATION_FIELDS | {'receivedAt'}
 _RECEIPT_FIELDS = {'schemaVersion', 'repositoryId',
                    'repositoryIdentity', 'snapshotId', 'manifest'}
+_OPERATION_VIEW_FIELDS = {'schemaVersion', 'operationId', 'requestId',
+                          'workloadId', 'hostId', 'generation', 'step',
+                          'status', 'result', 'errorCode'}
 
 
 def _check(fn, *args):
@@ -653,9 +660,10 @@ class Controller:
 
     def __init__(self, config, *, transport=None, context=None,
                  runner=None, worker_factory=worker.Worker,
-                 clock=time.time):
+                 clock=time.time, sleeper=time.sleep):
         self._config = validate_config(config)
         self.clock = clock
+        self._sleeper = sleeper
         self.runner = runner or CliRunner()
         self._worker_config = _load_worker_config(
             self._config['workerConfigFile'])
@@ -876,6 +884,86 @@ class Controller:
                 return entry
         return None
 
+    # -- remote dispatch (pull-model operation queue) -----------------------
+
+    def _dispatch_view(self, job, operation_id, request_id, host_id,
+                       step, generation):
+        """Read back one operation the controller posted. Strictly
+        validated: any mismatch in the echoed identity is a registry
+        protocol violation, not a result."""
+        status, body = self._transport.request(
+            'GET', '/v2/operations/{}?requestId={}'.format(
+                operation_id, request_id))
+        if status != 200 or type(body) is not dict:
+            raise ControllerError(self._registry_code(status, body))
+        if set(body) - _OPERATION_VIEW_FIELDS \
+                or body.get('schemaVersion') != 2 \
+                or body.get('operationId') != operation_id \
+                or body.get('requestId') != request_id \
+                or body.get('workloadId') != job['workloadId'] \
+                or body.get('hostId') != host_id \
+                or body.get('generation') != generation \
+                or body.get('step') != step \
+                or body.get('status') \
+                not in registry._OPERATION_STATUSES:
+            raise ControllerError('registry-response-invalid')
+        if body['status'] == 'completed' \
+                and type(body.get('result')) is not dict:
+            raise ControllerError('registry-response-invalid')
+        if body['status'] == 'failed' \
+                and (type(body.get('errorCode')) is not str
+                     or worker._IDENTIFIER_RE.fullmatch(
+                         body['errorCode']) is None):
+            raise ControllerError('registry-response-invalid')
+        return body
+
+    def _remote_step(self, job, label, host_id, step, generation,
+                     payload):
+        """Post one dispatch operation (requestId replay-safe) and read
+        its receipt state once. Returns the view on 'completed';
+        pending/claimed raises _Deferred carrying the full instruction
+        so an operator can still perform the step manually; 'failed'
+        raises a typed ControllerError."""
+        operation_id = payload.get('operationId') \
+            if type(payload) is dict else None
+        if type(operation_id) is not str:
+            operation_id = _derive(job['operationId'], 'op:' + label)
+        request_id = _derive(job['operationId'], 'post:' + label)
+        status, body = self._transport.request(
+            'POST', '/v2/operations',
+            {'schemaVersion': 2, 'requestId': request_id,
+             'operationId': operation_id,
+             'workloadId': job['workloadId'], 'hostId': host_id,
+             'generation': generation, 'step': step,
+             'payload': payload})
+        if status != 200 or type(body) is not dict \
+                or body.get('status') != 'accepted' \
+                or body.get('operationId') != operation_id \
+                or body.get('requestId') != request_id:
+            raise ControllerError(self._registry_code(status, body))
+        view = None
+        for attempt in range(_DISPATCH_POLLS):
+            view = self._dispatch_view(job, operation_id, request_id,
+                                       host_id, step, generation)
+            if view['status'] in ('completed', 'failed'):
+                break
+            if attempt + 1 < _DISPATCH_POLLS:
+                self._sleeper(_DISPATCH_POLL_DELAY)
+        if view['status'] == 'failed':
+            code = view.get('errorCode')
+            raise ControllerError(
+                'remote-' + code if type(code) is str
+                and worker._IDENTIFIER_RE.fullmatch(code)
+                else 'remote-failed')
+        if view['status'] != 'completed':
+            raise _Deferred({'disposition': 'remote-dispatched',
+                             'operationId': operation_id,
+                             'requestId': request_id, 'step': step,
+                             'hostId': host_id,
+                             'operationStatus': view['status'],
+                             'instruction': payload})
+        return view
+
     @staticmethod
     def _fresh_observation(entry):
         """The registry already classifies staleness: 'stale'/'lost'
@@ -1013,6 +1101,18 @@ class Controller:
         request = self._worker_request(
             job, 'freeze', 'freeze', job['fromInstanceId'],
             job['generation'], capture_id=job['captureId'])
+        if job['fromHostId'] != self._config['hostId']:
+            view = self._remote_step(
+                job, 'freeze', job['fromHostId'], 'freeze',
+                job['generation'], request)
+            result = view['result']
+            if result.get('appliedPhase') != 'stopped' \
+                    or result.get('captureId') != job['captureId']:
+                raise ControllerError('remote-receipt-invalid')
+            return {'disposition': 'remote',
+                    'operationId': view['operationId'],
+                    'captureId': job['captureId'],
+                    'appliedPhase': 'stopped'}
         receipt = self._worker_execute(request)
         if receipt.get('appliedPhase') != 'stopped' \
                 or receipt.get('captureId') != job['captureId']:
@@ -1022,15 +1122,36 @@ class Controller:
 
     def _step_capture(self, job, entry):
         config = self._config
+        capture_request = {'schemaVersion': 1, 'action': 'capture',
+                           'captureId': job['captureId'],
+                           'workloadId': job['workloadId'],
+                           'revisionDigest': job['revisionDigest'],
+                           'instanceId': job['fromInstanceId'],
+                           'generation': job['generation']}
+        upload_request = {'schemaVersion': 1, 'action': 'upload',
+                          'captureId': job['captureId'],
+                          'repositoryId': job['repositoryId']}
+        if job['fromHostId'] != self._config['hostId']:
+            view = self._remote_step(
+                job, 'capture', job['fromHostId'], 'capture',
+                job['generation'],
+                {'capture': capture_request, 'upload': upload_request})
+            result = view['result']
+            if type(result.get('snapshotId')) is not str \
+                    or _HEX64_RE.fullmatch(result['snapshotId']) is None \
+                    or result.get('repositoryId') != job['repositoryId'] \
+                    or type(result.get('verifiedAt')) is not int \
+                    or not 0 <= result['verifiedAt'] <= 2**53:
+                raise ControllerError('remote-receipt-invalid')
+            job['snapshotId'] = result['snapshotId']
+            return {'disposition': 'remote',
+                    'operationId': view['operationId'],
+                    'snapshotId': result['snapshotId'],
+                    'repositoryId': result['repositoryId'],
+                    'verifiedAt': result['verifiedAt']}
         capture = self._cli(
             config['backupProgram'], config['backupConfigFile'],
-            {'schemaVersion': 1, 'action': 'capture',
-             'captureId': job['captureId'],
-             'workloadId': job['workloadId'],
-             'revisionDigest': job['revisionDigest'],
-             'instanceId': job['fromInstanceId'],
-             'generation': job['generation']}, 'backup',
-            timeout=_BULK_TIMEOUT)
+            capture_request, 'backup', timeout=_BULK_TIMEOUT)
         record = capture.get('record')
         if type(record) is not dict \
                 or type(record.get('snapshotId')) is not str \
@@ -1038,10 +1159,7 @@ class Controller:
             raise ControllerError('backup-receipt-invalid')
         upload = self._cli(
             config['backupProgram'], config['backupConfigFile'],
-            {'schemaVersion': 1, 'action': 'upload',
-             'captureId': job['captureId'],
-             'repositoryId': job['repositoryId']}, 'backup',
-            timeout=_BULK_TIMEOUT)
+            upload_request, 'backup', timeout=_BULK_TIMEOUT)
         uploaded = upload.get('record')
         if type(uploaded) is not dict \
                 or type(uploaded.get('snapshotId')) is not str \
@@ -1061,6 +1179,17 @@ class Controller:
         request = self._worker_request(
             job, 'thaw', 'thaw', job['fromInstanceId'],
             job['generation'], capture_id=job['captureId'])
+        if job['fromHostId'] != self._config['hostId']:
+            view = self._remote_step(
+                job, 'thaw', job['fromHostId'], 'thaw',
+                job['generation'], request)
+            result = view['result']
+            if result.get('appliedPhase') != 'stopped' \
+                    or result.get('captureId') != job['captureId']:
+                raise ControllerError('remote-receipt-invalid')
+            return {'disposition': 'remote',
+                    'operationId': view['operationId'],
+                    'appliedPhase': 'stopped'}
         receipt = self._worker_execute(request)
         if receipt.get('appliedPhase') != 'stopped' \
                 or receipt.get('captureId') != job['captureId']:
@@ -1068,7 +1197,18 @@ class Controller:
         return {'appliedPhase': receipt['appliedPhase']}
 
     def _step_retire_source(self, job, entry):
-        if entry['state'] != 'deferred':
+        if job['fromHostId'] != self._config['hostId']:
+            # Remote retire: dispatched through the reporter; the op is
+            # replay-safe so re-posting while deferred is harmless.
+            view = self._remote_step(
+                job, 'retire', job['fromHostId'], 'retire',
+                job['generation'],
+                self._worker_request(
+                    job, 'retire', 'retire', job['fromInstanceId'],
+                    job['generation']))
+            if view['result'].get('appliedPhase') != 'stopped':
+                raise ControllerError('remote-receipt-invalid')
+        elif entry['state'] != 'deferred':
             request = self._worker_request(
                 job, 'retire', 'retire', job['fromInstanceId'],
                 job['generation'])
@@ -1140,19 +1280,43 @@ class Controller:
 
     def _step_install_target(self, job, entry):
         if job['toHostId'] != self._config['hostId']:
-            # Remote path: no control channel exists in M5. Verify
-            # completion only through fresh registry evidence — a fresh
-            # observation proving the new instance reached a real
-            # post-prepare phase.
-            found = self._ready_evidence(job)
-            if found is not None:
-                entry_row, _observation = found
-                if entry_row['observedState'] in (
-                        'prepared', 'starting', 'running'):
-                    return {'disposition': 'remote-verified'}
-            raise _Deferred(
-                {'disposition': 'remote-deferred',
-                 'instruction': self._remote_instruction(job)})
+            # Remote install: four dispatch operations — prepare,
+            # observe (to learn the worker-allocated slot), restore
+            # stage + commit, start. Each is replay-safe; deferred
+            # checkpoints resume without re-executing completed ops.
+            instruction = self._remote_instruction(job)
+            self._remote_step(
+                job, 'prepare', job['toHostId'], 'prepare',
+                job['newGeneration'], instruction['prepare'])
+            observe = {'schemaVersion': 1, 'action': 'observe',
+                       'instanceId': job['newInstanceId']}
+            view = self._remote_step(
+                job, 'observe', job['toHostId'], 'observe',
+                job['newGeneration'], observe)
+            observed = view['result']
+            if observed.get('bindingCurrent') is not True:
+                raise ControllerError('remote-receipt-invalid')
+            slot_id = observed.get('slotId')
+            if type(slot_id) is not str:
+                raise ControllerError('remote-receipt-invalid')
+            if job['toSlotId'] is not None and slot_id != job['toSlotId']:
+                raise ControllerError('slot-mismatch')
+            job['toSlotId'] = slot_id
+            stage = dict(instruction['restoreStage'])
+            stage['target'] = dict(stage['target'], slotId=slot_id)
+            self._remote_step(
+                job, 'restore-stage', job['toHostId'], 'restore-stage',
+                job['newGeneration'], stage)
+            self._remote_step(
+                job, 'restore-commit', job['toHostId'],
+                'restore-commit', job['newGeneration'],
+                instruction['restoreCommit'])
+            view = self._remote_step(
+                job, 'start', job['toHostId'], 'start',
+                job['newGeneration'], instruction['start'])
+            if view['result'].get('appliedPhase') != 'running':
+                raise ControllerError('remote-receipt-invalid')
+            return {'disposition': 'remote', 'slotId': slot_id}
         self._worker_execute(self._worker_request(
             job, 'prepare', 'prepare', job['newInstanceId'],
             job['newGeneration']))
@@ -1323,8 +1487,6 @@ class Controller:
                     'action': 'execute',
                     'operationId': request['operationId'],
                     'operation': self._operation_view(job)}
-        if job['fromHostId'] != self._config['hostId']:
-            raise ControllerError('source-not-local')
         if job['phase'] == 'planned':
             job['phase'] = _STEP_ORDER[0]
             self._save_job(job)

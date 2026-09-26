@@ -16,6 +16,7 @@ import re
 import socket
 import ssl
 import sys
+import urllib.parse
 from pathlib import Path
 
 import common
@@ -148,12 +149,71 @@ def _handler(reg, clients):
                 raise registry.RegistryError('invalid-request')
             return value
 
+        def _query(self, allowed):
+            """Strict query parsing for the operations endpoints — the
+            only paths that may carry a query string at all."""
+            query = self.path.partition('?')[2]
+            try:
+                pairs = urllib.parse.parse_qsl(
+                    query, keep_blank_values=True, strict_parsing=True,
+                    max_num_fields=8, errors='strict')
+            except (ValueError, UnicodeError):
+                raise registry.RegistryError('invalid-request') from None
+            params = {}
+            for key, value in pairs:
+                if key not in allowed or key in params or len(key) > 32 \
+                        or len(value) > 64:
+                    raise registry.RegistryError('invalid-request')
+                params[key] = value
+            return params
+
+        def _operations(self, method, principal, path):
+            """The dispatch surface: /v2/operations collection plus
+            /v2/operations/<operationId>[/receipt] members."""
+            if path == '/v2/operations':
+                if method == 'POST':
+                    if '?' in self.path:
+                        raise registry.RegistryError('not-found', 404)
+                    return reg.post_operation(principal, self._body())
+                if method != 'GET':
+                    raise registry.RegistryError('not-found', 404)
+                params = self._query({'host', 'after'})
+                host = params.get('host')
+                if host is None:
+                    host = principal.host_id
+                elif not worker._IDENTIFIER_RE.fullmatch(host):
+                    raise registry.RegistryError('invalid-host')
+                after_raw = params.get('after', '0')
+                if not after_raw.isdigit() or len(after_raw) > 20:
+                    raise registry.RegistryError('invalid-after')
+                return reg.poll_operations(principal, host,
+                                           int(after_raw))
+            prefix = '/v2/operations/'
+            if not path.startswith(prefix):
+                raise registry.RegistryError('not-found', 404)
+            rest = path[len(prefix):]
+            if method == 'POST' and rest.endswith('/receipt') \
+                    and '/' not in rest[:-len('/receipt')]:
+                if '?' in self.path:
+                    raise registry.RegistryError('not-found', 404)
+                return reg.operation_receipt(
+                    principal, rest[:-len('/receipt')], self._body())
+            if method == 'GET' and '/' not in rest and rest:
+                params = self._query({'requestId'})
+                request_id = params.get('requestId')
+                if request_id is None:
+                    raise registry.RegistryError('invalid-request')
+                return reg.operation_status(principal, rest, request_id)
+            raise registry.RegistryError('not-found', 404)
+
         def _dispatch(self, method, principal):
             if self.headers.get('Origin') is not None \
                     or self.headers.get('Cookie') is not None:
                 raise registry.RegistryError('browser-request-forbidden', 403)
-            path = self.path
-            if '?' in path:
+            path = self.path.partition('?')[0]
+            if path.startswith('/v2/operations'):
+                return self._operations(method, principal, path)
+            if '?' in self.path:
                 raise registry.RegistryError('not-found', 404)
             if method == 'GET':
                 if path == '/v2/state':
