@@ -13,7 +13,7 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.nexus-workload-reporter;
-  configJson = pkgs.writeText "nexus-reporter-config.json" (builtins.toJSON {
+  configJson = pkgs.writeText "nexus-reporter-config.json" (builtins.toJSON ({
     schemaVersion = 2;
     hostId = cfg.hostId;
     registryUrl = cfg.registryUrl;
@@ -23,7 +23,14 @@ let
     observeIntervalSeconds = cfg.observeIntervalSeconds;
     requestTimeoutSeconds = cfg.requestTimeoutSeconds;
     maxBackoffSeconds = cfg.maxBackoffSeconds;
-  });
+    # Optional dispatch CLIs: reporter.py accepts each program/config
+    # pair only together; an absent pair makes the matching dispatch
+    # steps refuse locally with a typed error receipt.
+  } // lib.optionalAttrs (cfg.backupProgram != null) {
+    inherit (cfg) backupProgram backupConfigFile;
+  } // lib.optionalAttrs (cfg.restoreProgram != null) {
+    inherit (cfg) restoreProgram restoreConfigFile;
+  }));
   reporterLib = pkgs.runCommand "nexus-reporter-lib" { } ''
     mkdir $out
     for name in reporter registry statefiles worker artifacts catalog; do
@@ -32,9 +39,11 @@ let
   '';
   reporterService = pkgs.writeShellApplication {
     name = "nexus-reporter";
+    # pkgs.nix is required: the embedded worker's verify_closure
+    # shells out to nix/nix-store on dispatched prepare/start steps.
     runtimeInputs = [
       pkgs.python3 pkgs.systemd pkgs.util-linux pkgs.iproute2
-      pkgs.coreutils
+      pkgs.coreutils pkgs.nix
     ];
     text = ''
       exec ${pkgs.python3}/bin/python3 ${reporterLib}/reporter.py --config ${configJson}
@@ -91,6 +100,26 @@ in {
       type = lib.types.str;
       description = "Runtime path to the host client private key; must not be a Nix store path.";
     };
+    backupProgram = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "Path to the pinned nexus-backup executable used for dispatched capture/upload steps; must be set together with backupConfigFile or the pair is omitted.";
+    };
+    backupConfigFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Absolute runtime path to the backup configuration JSON consumed by backupProgram; required when backupProgram is set.";
+    };
+    restoreProgram = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "Path to the pinned nexus-restore executable used for dispatched restore-stage/restore-commit steps; must be set together with restoreConfigFile or the pair is omitted.";
+    };
+    restoreConfigFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Absolute runtime path to the restore configuration JSON consumed by restoreProgram; required when restoreProgram is set.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -99,8 +128,14 @@ in {
         && !lib.hasPrefix builtins.storeDir cfg.certificateFile
         && !lib.hasPrefix builtins.storeDir cfg.keyFile
         && lib.hasPrefix "/" cfg.workerConfigFile
-        && lib.hasPrefix "/" cfg.stateDir;
-      message = "services.nexus-workload-reporter credential paths must be runtime paths, not Nix store paths, and workerConfigFile/stateDir must be absolute.";
+        && lib.hasPrefix "/" cfg.stateDir
+        && (cfg.backupProgram == null) == (cfg.backupConfigFile == null)
+        && (cfg.restoreProgram == null) == (cfg.restoreConfigFile == null)
+        && (cfg.backupConfigFile == null
+            || lib.hasPrefix "/" cfg.backupConfigFile)
+        && (cfg.restoreConfigFile == null
+            || lib.hasPrefix "/" cfg.restoreConfigFile);
+      message = "services.nexus-workload-reporter credential paths must be runtime paths, not Nix store paths; workerConfigFile/stateDir must be absolute; and each backup/restore program must be paired with its absolute configFile.";
     }];
 
     systemd.tmpfiles.rules = [

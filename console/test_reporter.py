@@ -356,6 +356,27 @@ class CycleTests(ReporterFixture):
         instance = self.make_reporter()
         posted, skipped = instance.run_once()
         self.assertEqual((posted, skipped), (0, 1))
+        drops = [entry for entry in self.logs
+                 if entry['event'] == 'observation-dropped']
+        self.assertEqual(drops, [{'event': 'observation-dropped',
+                                  'code': 'instance-mismatch',
+                                  'skipped': 1}])
+
+    def test_future_observation_drop_is_surfaced(self):
+        # A clock-leading host gets every observation dropped by the
+        # registry; the reason must reach the log, not just the bare
+        # skipped counter.
+        self.transport.observation_responses = [
+            (422, {'schemaVersion': 2, 'status': 'error',
+                   'error': 'observation-future'})]
+        instance = self.make_reporter()
+        posted, skipped = instance.run_once()
+        self.assertEqual((posted, skipped), (0, 1))
+        drops = [entry for entry in self.logs
+                 if entry['event'] == 'observation-dropped']
+        self.assertEqual(drops, [{'event': 'observation-dropped',
+                                  'code': 'observation-future',
+                                  'skipped': 1}])
 
     def test_observer_failure_skips_instance(self):
         self.transport.assignments = [assignment(I1), assignment(

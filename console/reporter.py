@@ -731,9 +731,10 @@ class Reporter:
                 'endpointAddress': endpoint, 'readyServices': ready}
 
     def _post_observation(self, observation):
-        """POST one observation. Returns 'accepted'/'drop'; raises
-        SessionLost for session/sequence rejection, ReporterError
-        otherwise."""
+        """POST one observation. Returns 'accepted' or the registry's
+        typed drop code ('instance-mismatch', 'observation-stale',
+        'observation-future'); raises SessionLost for session/sequence
+        rejection, ReporterError otherwise."""
         status, body = self._transport.request(
             'POST', '/v2/observations', observation)
         if status == 200 and type(body) is dict \
@@ -743,7 +744,7 @@ class Reporter:
         if code in _SESSION_CODES:
             raise SessionLost(code)
         if code in _SKIP_CODES or code in _DROP_CODES:
-            return 'drop'
+            return code
         raise ReporterError(self._registry_code(status, body))
 
     # -- operation dispatch (M5) ------------------------------------------
@@ -1239,6 +1240,7 @@ class Reporter:
             self._open_session()
         assignments = self._fetch_assignments()
         posted = skipped = 0
+        drops = {}
         for row in assignments:
             observation = self._observe_instance(row)
             if observation is None:
@@ -1260,7 +1262,16 @@ class Reporter:
                 posted += 1
             else:
                 skipped += 1
+                drops[outcome] = drops.get(outcome, 0) + 1
         dispatched = self._dispatch_cycle(assignments)
+        # Registry-side drops are otherwise silent: a clock-leading
+        # host could lose every observation to 'observation-future'
+        # with only a bare skipped count as evidence. Surface the
+        # reason once per code per cycle (the drops are intentional;
+        # only their invisibility was the defect).
+        for code in sorted(drops):
+            self._log('observation-dropped', code=code,
+                      skipped=drops[code])
         self._log('cycle', posted=posted, skipped=skipped,
                   dispatched=dispatched)
         return posted, skipped
