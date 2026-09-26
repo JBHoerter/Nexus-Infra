@@ -111,7 +111,8 @@ _DISPATCH_FIELDS = {'schemaVersion', 'operationId', 'seq', 'workloadId',
                     'generation', 'step', 'payload', 'claimRequestId',
                     'receiptRequestId', 'phase', 'result', 'errorCode'}
 _DISPATCH_PHASES = ('claiming', 'claimed', 'executed')
-_WORKER_STEPS = ('prepare', 'start', 'stop', 'freeze', 'thaw', 'retire')
+_WORKER_STEPS = ('prepare', 'adopt', 'start', 'stop', 'freeze', 'thaw',
+                 'retire')
 _STAGE_FIELDS = {'schemaVersion', 'action', 'restoreId', 'repositoryId',
                  'snapshotId', 'target'}
 _TARGET_FIELDS = {'workloadId', 'revisionDigest', 'instanceId',

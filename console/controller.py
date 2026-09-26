@@ -134,7 +134,9 @@ _PHASES = ('planned', 'completed', 'aborted') + _STEP_ORDER
 _CHECKPOINT_FIELDS = {'step', 'state', 'at', 'detail'}
 _CHECKPOINT_STATES = ('started', 'deferred', 'completed')
 _STATE_FIELDS = {'schemaVersion', 'registryEpoch', 'version',
-                 'workloads'}
+                 'workloads', 'fences'}
+_FENCE_VIEW_FIELDS = {'workloadId', 'generation', 'hostId', 'evidence',
+                      'attestedBy', 'requestId', 'recordedAt'}
 _WORKLOAD_FIELDS = {'workloadId', 'generation', 'instanceId', 'hostId',
                     'revisionDigest', 'published', 'observedState',
                     'observation'}
@@ -801,9 +803,34 @@ class Controller:
                 or type(body['workloads']) is not list \
                 or len(body['workloads']) > 1024:
             raise ControllerError('registry-response-invalid')
+        fences = body['fences']
+        if type(fences) is not list or len(fences) > 4096:
+            raise ControllerError('registry-response-invalid')
+        for fence in fences:
+            self._validate_fence(fence)
         for entry in body['workloads']:
             self._validate_entry(entry)
         return body
+
+    @staticmethod
+    def _validate_fence(fence):
+        if type(fence) is not dict \
+                or set(fence) != _FENCE_VIEW_FIELDS:
+            raise ControllerError('registry-response-invalid')
+        try:
+            worker._identifier(fence['workloadId'], 'fence')
+            worker._integer(fence['generation'], 1, worker._MAX_I64,
+                            'fence')
+            worker._identifier(fence['hostId'], 'fence')
+            worker._hex32(fence['requestId'], 'fence')
+        except worker.WorkerError:
+            raise ControllerError('registry-response-invalid') from None
+        if fence['evidence'] not in registry._FENCE_EVIDENCE \
+                or type(fence['attestedBy']) is not str \
+                or not fence['attestedBy'] \
+                or len(fence['attestedBy']) > 512 \
+                or type(fence['recordedAt']) not in (int, float):
+            raise ControllerError('registry-response-invalid')
 
     def _validate_entry(self, entry):
         if type(entry) is not dict or set(entry) != _WORKLOAD_FIELDS:

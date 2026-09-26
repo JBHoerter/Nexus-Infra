@@ -620,5 +620,53 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(payload['error'], 'session-mismatch')
 
 
+    def test_fence_endpoint_over_tls(self):
+        self.post_json('controller', '/v2/placements/assign',
+                       test_registry.assign_request())
+        fence = test_registry.fence_request()
+        # Only the controller role may attest a fence.
+        for name in ('reader', 'ingress', 'host-a', 'host-b'):
+            status, payload = self.post_json(
+                name, '/v2/placements/fence', fence)
+            self.assertEqual(status, 403, (name, payload))
+            self.assertEqual(payload['error'], 'forbidden')
+        status, payload = self.post_json(
+            'controller', '/v2/placements/fence', fence)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['status'], 'accepted')
+        self.assertEqual(payload['generation'], 1)
+        # Identical replay returns the same receipt; a mutated body
+        # under the same requestId conflicts.
+        status, replay = self.post_json(
+            'controller', '/v2/placements/fence', fence)
+        self.assertEqual((status, replay), (200, payload))
+        status, payload = self.post_json(
+            'controller', '/v2/placements/fence',
+            dict(fence, evidence='operator'))
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload['error'], 'request-conflict')
+        status, payload = self.post_json(
+            'controller', '/v2/placements/fence',
+            test_registry.fence_request(request_id='f2' * 16,
+                                        evidence='bogus'))
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload['error'], 'invalid-evidence')
+        # The fence unblocks a successor assign with no observation at
+        # all, and the projection is visible to readers.
+        status, payload = self.post_json(
+            'controller', '/v2/placements/assign',
+            test_registry.assign_request(
+                test_registry.I2, 'host-b', 1, 'a2' * 16))
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['generation'], 2)
+        status, state = self.call(self.client_context('reader'),
+                                  'GET', '/v2/state')
+        self.assertEqual(status, 200, state)
+        self.assertEqual(len(state['fences']), 1)
+        self.assertEqual(state['fences'][0]['hostId'], 'host-a')
+        self.assertEqual(state['fences'][0]['attestedBy'],
+                         'urn:nexus:controller:ops')
+
+
 if __name__ == '__main__':
     unittest.main()

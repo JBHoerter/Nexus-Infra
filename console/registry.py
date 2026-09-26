@@ -7,7 +7,18 @@ mTLS/ingress integration exists; there is no network listener here. Host
 observations are self-reported evidence: a missing or stale sample is never
 proof a host is down, and a reported retirement is not off-host fencing. A
 successor placement requires a fresh, current-session observation proving the
-old instance retired AND drained.
+old instance retired AND drained — OR a committed fence record (M8): a
+durable, controller-posted attestation scoped to the incumbent's
+(workloadId, generation) and bound to its hostId, recorded BEFORE the host
+reports anything, for the case where a dead or partitioned host can never
+report itself (docs/replication-failover-design.md). A fence record only
+unblocks successor ``assign``; it never marks an observed-live instance
+dead — routes, publish and observed state remain governed by fresh
+observations alone, and withdraw rules are unchanged. Nothing in this
+module or anywhere in Nexus issues fence records automatically: posting one
+is an explicit act of a future authorized failover component (DRBD
+quorum-attested) or of an operator — there is no automatic failover
+trigger here by design.
 
 The operation queue is a rendezvous, not a control channel: a controller
 POSTs a bounded operation bound to the CURRENT placement generation of a
@@ -68,8 +79,12 @@ _OBSERVATION_FIELDS = {'schemaVersion', 'hostId', 'sessionId', 'sequence',
                        'readyServices'}
 _OPERATION_FIELDS = {'schemaVersion', 'requestId', 'operationId',
                      'workloadId', 'hostId', 'generation', 'step', 'payload'}
-_OPERATION_STEPS = ('prepare', 'restore-stage', 'restore-commit', 'start',
-                    'stop', 'observe', 'freeze', 'capture', 'thaw', 'retire')
+_OPERATION_STEPS = ('prepare', 'adopt', 'restore-stage', 'restore-commit',
+                    'start', 'stop', 'observe', 'freeze', 'capture', 'thaw',
+                    'retire')
+_FENCE_FIELDS = {'schemaVersion', 'requestId', 'workloadId', 'generation',
+                 'hostId', 'evidence'}
+_FENCE_EVIDENCE = ('quorum-attested', 'operator')
 _OPERATION_STATUSES = ('pending', 'claimed', 'completed', 'failed')
 _RECEIPT_BASE = {'schemaVersion', 'requestId', 'status'}
 _OPERATION_PENDING_MAX = 256
@@ -101,6 +116,11 @@ CREATE TABLE IF NOT EXISTS operations(operation_id TEXT PRIMARY KEY,
     request_id TEXT NOT NULL UNIQUE, principal TEXT NOT NULL,
     status TEXT NOT NULL, claim_request_id TEXT, claim_body TEXT,
     final_request_id TEXT, final_body TEXT);
+CREATE TABLE IF NOT EXISTS fences(workload_id TEXT NOT NULL,
+    generation INTEGER NOT NULL, host_id TEXT NOT NULL,
+    evidence TEXT NOT NULL, attester TEXT NOT NULL,
+    request_id TEXT NOT NULL, recorded_at REAL NOT NULL,
+    PRIMARY KEY(workload_id, generation));
 '''
 
 
@@ -347,6 +367,20 @@ def _validate_receipt(request):
     return request
 
 
+def _validate_fence(request):
+    _check(worker._fields, request, _FENCE_FIELDS, 'request')
+    _check(worker._integer, request['schemaVersion'], 2, 2,
+           'schemaVersion')
+    _check(worker._hex32, request['requestId'], 'requestId')
+    _check(worker._identifier, request['workloadId'], 'workloadId')
+    _check(worker._integer, request['generation'], 1, _MAX_I64,
+           'generation')
+    _check(worker._identifier, request['hostId'], 'hostId')
+    if request['evidence'] not in _FENCE_EVIDENCE:
+        raise RegistryError('invalid-evidence')
+    return request
+
+
 class Registry:
     def __init__(self, config, db_path, *, clock=time.time,
                  monotonic=time.monotonic, epoch=None):
@@ -450,6 +484,13 @@ class Registry:
                 ' FROM operations'):
             if host_id not in self._hosts \
                     or (workload_id, generation) not in generations:
+                raise RegistryError('registry-config-incompatible', 409)
+        for host_id, workload_id, generation, evidence in self.db.execute(
+                'SELECT host_id, workload_id, generation, evidence'
+                ' FROM fences'):
+            if host_id not in self._hosts \
+                    or (workload_id, generation) not in generations \
+                    or evidence not in _FENCE_EVIDENCE:
                 raise RegistryError('registry-config-incompatible', 409)
 
     def _now(self):
@@ -707,7 +748,10 @@ class Registry:
                     old = self._instance(placement[1])
                     observation = self._observation_row(placement[1])
                     if not self._retired_drained(
-                            observation, old[2] if old else None, now, mono):
+                            observation, old[2] if old else None,
+                            now, mono) and not self._fenced(
+                            req['workloadId'], current,
+                            old[2] if old else None):
                         raise RegistryError('retirement-required', 409)
                 if self._instance(req['instanceId']) is not None:
                     raise RegistryError('instance-conflict', 409)
@@ -785,6 +829,93 @@ class Registry:
 
     def withdraw(self, principal, request):
         return self._publish_withdraw(principal, request, 'withdraw')
+
+    def _fenced(self, workload_id, generation, host_id):
+        """True when a committed fence record covers exactly this
+        incumbent (workloadId, generation, hostId). A fence never marks
+        an observed-live instance dead — it only substitutes for the
+        retired+drained self-report a dead host can never post."""
+        if host_id is None:
+            return False
+        return self.db.execute(
+            'SELECT 1 FROM fences WHERE workload_id=? AND generation=?'
+            ' AND host_id=?',
+            (workload_id, generation, host_id)).fetchone() is not None
+
+    def fence(self, principal, request):
+        """Controller-only durable fence attestation (M8).
+
+        Commits a fence record bound to the CURRENT placement's
+        (workloadId, generation) and the host holding it — the evidence
+        a future authorized failover component (or an operator) posts
+        before assigning a successor when the incumbent host is dead or
+        partitioned and can never self-report retirement. The record is
+        idempotent on requestId and survives restart; it is a permanent
+        tombstone once the generation advances. A second, identical
+        attestation for the same scope under a new requestId is accepted
+        and recorded; a differing hostId/evidence for the same scope is
+        a conflict. Nothing posts this record automatically — there is
+        no automatic failover trigger in Nexus."""
+        with self._mutex:
+            self._principal(principal, ('controller',))
+            req = _validate_fence(request)
+            now = self._now()
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                replay = self._request_replay(principal, 'fence', req)
+                if replay is not None:
+                    self._commit()
+                    return replay
+                if req['workloadId'] not in self._revisions:
+                    raise RegistryError('unknown-workload', 404)
+                if req['hostId'] not in self._hosts:
+                    raise RegistryError('unknown-host', 404)
+                placement = self._placement(req['workloadId'])
+                if placement is None \
+                        or placement[0] != req['generation']:
+                    raise RegistryError('generation-conflict', 409)
+                instance = self._instance(placement[1])
+                if instance is None or instance[2] != req['hostId']:
+                    raise RegistryError('generation-conflict', 409)
+                existing = self.db.execute(
+                    'SELECT host_id, evidence FROM fences'
+                    ' WHERE workload_id=? AND generation=?',
+                    (req['workloadId'], req['generation'])).fetchone()
+                if existing is not None:
+                    if (existing[0], existing[1]) != (req['hostId'],
+                                                    req['evidence']):
+                        raise RegistryError('fence-conflict', 409)
+                else:
+                    self.db.execute(
+                        'INSERT INTO fences(workload_id, generation,'
+                        ' host_id, evidence, attester, request_id,'
+                        ' recorded_at) VALUES(?,?,?,?,?,?,?)',
+                        (req['workloadId'], req['generation'],
+                         req['hostId'], req['evidence'],
+                         principal.identity, req['requestId'], now))
+                receipt = {'schemaVersion': 2, 'status': 'accepted',
+                           'requestId': req['requestId'],
+                           'workloadId': req['workloadId'],
+                           'generation': req['generation'],
+                           'hostId': req['hostId'],
+                           'evidence': req['evidence']}
+                self._record_request(principal, 'fence', req, receipt)
+                self._bump()
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+            return receipt
+
+    def _fence_rows(self):
+        return [{'workloadId': row[0], 'generation': row[1],
+                 'hostId': row[2], 'evidence': row[3],
+                 'attestedBy': row[4], 'requestId': row[5],
+                 'recordedAt': row[6]}
+                for row in self.db.execute(
+                    'SELECT workload_id, generation, host_id, evidence,'
+                    ' attester, request_id, recorded_at FROM fences'
+                    ' ORDER BY workload_id, generation')]
 
     def assignments(self, principal):
         with self._mutex:
@@ -1030,7 +1161,8 @@ class Registry:
                     'published': bool(placement[2]),
                     'observedState': observed_state, 'observation': view})
             return {'schemaVersion': 2, 'registryEpoch': self.epoch,
-                    'version': self._version(), 'workloads': workloads}
+                    'version': self._version(), 'workloads': workloads,
+                    'fences': self._fence_rows()}
 
     def routes(self, principal, nonce):
         with self._mutex:

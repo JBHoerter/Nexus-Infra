@@ -88,9 +88,10 @@ def workload_row(instance=I1, host='host-a', generation=1,
             'observedState': observed_state, 'observation': obs}
 
 
-def state_body(*rows):
+def state_body(*rows, fences=()):
     return {'schemaVersion': 2, 'registryEpoch': 'e0' * 16,
-            'version': 1, 'workloads': list(rows)}
+            'version': 1, 'workloads': list(rows),
+            'fences': list(fences)}
 
 
 def plan_request(operation_id=OP1, **overrides):

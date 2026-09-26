@@ -2991,5 +2991,258 @@ class CaptureBarrierTests(unittest.TestCase):
                 len(stops))
 
 
+class AdoptTests(unittest.TestCase):
+    """M8 worker state-dir adoption: a strictly validated exception to
+    ``prepare``'s no-pre-existing-dir invariant, for DRBD failover pairs
+    whose slots share a symmetric uidBase."""
+
+    def _replica(self, storage_root, fs, instance='0a' * 16,
+                 uid_base=65536, mounts=('data',), leaf=None):
+        """Lay down a uidBase-owned replica dir exactly as failover
+        provisioning delivers it."""
+        idir = os.path.join(storage_root, instance)
+        os.mkdir(idir, 0o700)
+        fs.owners[idir] = (uid_base, uid_base)
+        for name in mounts:
+            leaf_dir = os.path.join(idir, name)
+            os.mkdir(leaf_dir, 0o700)
+            fs.owners[leaf_dir] = (uid_base, uid_base)
+            if leaf is not None:
+                fs.owners[leaf_dir] = leaf
+        return idir
+
+    def test_adopt_start_retire_lifecycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            idir = self._replica(storage, fs)
+            result = instance.execute(request(
+                'adopt', revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'prepared')
+            self.assertEqual(result['action'], 'adopt')
+            # The replica dir is claimed into normal root ownership.
+            self.assertIn((idir, 0, 0), fs.chowns)
+            # Adopted provenance is journaled and observable.
+            row = instance._get_instance('0a' * 16)
+            self.assertEqual(row['adopted'], 1)
+            observed = instance.execute(observe())
+            self.assertTrue(observed['adopted'])
+            self.assertEqual(observed['phase'], 'prepared')
+            result = instance.execute(request('start', op='bb' * 16,
+                                              revisionDigest=digest))
+            self.assertEqual(result['appliedPhase'], 'running')
+            result = instance.execute(request('retire', op='cc' * 16,
+                                              revisionDigest=digest))
+            self.assertEqual(result['appliedPhase'], 'stopped')
+            observed = instance.execute(observe())
+            self.assertTrue(observed['retired'])
+            self.assertTrue(observed['adopted'])
+
+    def test_adopt_replay_and_rejects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            self._replica(storage, fs)
+            first = instance.execute(request('adopt',
+                                             revisionDigest=digest))
+            self.assertEqual(first['status'], 'completed')
+            replay = instance.execute(request('adopt',
+                                              revisionDigest=digest))
+            self.assertEqual(replay, first)
+            # A fresh prepare cannot hijack the adopted instance, and a
+            # second adopt under a new operation id resumes cleanly.
+            result = instance.execute(request(
+                'prepare', op='ab' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'instance-conflict')
+            result = instance.execute(request(
+                'adopt', op='ac' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed')
+            # A stale generation is refused.
+            result = instance.execute(request(
+                'adopt', instance='3d' * 16, op='ad' * 16,
+                revisionDigest=digest))
+            self.assertEqual(result['error'], 'generation-stale')
+
+    def test_adopt_rejections(self):
+        cases = (
+            # absent dir: plain prepare territory
+            ('absent', 'adopt-state-absent'),
+            # replica for a different uidBase (or a local root dir)
+            ('root-owned', 'adopt-ownership-conflict'),
+            ('other-uid', 'adopt-ownership-conflict'),
+            # manifest violations
+            ('missing-leaf', 'adopt-state-conflict'),
+            ('extra-file', 'adopt-state-conflict'),
+            ('extra-dir', 'adopt-state-conflict'),
+            ('leaf-not-dir', 'adopt-state-conflict'),
+            ('leaf-wrong-owner', 'adopt-ownership-conflict'),
+            ('top-not-dir', 'adopt-state-conflict'),
+            ('top-wrong-mode', 'adopt-state-conflict'),
+        )
+        for scenario, code in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                instance, runner, fs, clock, definition, _ =                     make_worker(tmp)
+                digest = definition['revisionDigest']
+                storage = instance.config['storage']['root']
+                idir = os.path.join(storage, '0a' * 16)
+                if scenario == 'absent':
+                    pass
+                elif scenario == 'root-owned':
+                    os.mkdir(idir, 0o700)
+                    leaf = os.path.join(idir, 'data')
+                    os.mkdir(leaf, 0o700)
+                    fs.owners[leaf] = (65536, 65536)
+                elif scenario == 'other-uid':
+                    self._replica(storage, fs, uid_base=131072)
+                elif scenario == 'missing-leaf':
+                    self._replica(storage, fs, mounts=())
+                elif scenario == 'extra-file':
+                    self._replica(storage, fs)
+                    Path(idir, 'stray').write_text('x')
+                elif scenario == 'extra-dir':
+                    self._replica(storage, fs)
+                    os.mkdir(os.path.join(idir, 'stray'), 0o700)
+                elif scenario == 'leaf-not-dir':
+                    self._replica(storage, fs, mounts=())
+                    Path(idir, 'data').write_text('x')
+                elif scenario == 'leaf-wrong-owner':
+                    self._replica(storage, fs, leaf=(0, 0))
+                elif scenario == 'top-not-dir':
+                    Path(idir).write_text('x')
+                    fs.owners[idir] = (65536, 65536)
+                elif scenario == 'top-wrong-mode':
+                    self._replica(storage, fs)
+                    os.chmod(idir, 0o755)
+                result = instance.execute(request(
+                    'adopt', revisionDigest=digest))
+                self.assertEqual(result['status'], 'failed', scenario)
+                self.assertEqual(result['error'], code, scenario)
+                # A rejected adopt journals no instance record.
+                self.assertIsNone(instance._get_instance('0a' * 16))
+
+    def test_adopt_prepare_still_refuses_existing_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            self._replica(storage, fs)
+            result = instance.execute(request(
+                'prepare', revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'storage-state-conflict')
+
+    def test_adopt_tolerates_worker_own_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            idir = self._replica(storage, fs)
+            # A replicated in-flight restore claim and staging area are
+            # the worker's own files — tolerated, and the sentinel still
+            # blocks start until a restore commit.
+            Path(idir, '.nexus-restore-pending').write_text(
+                '{"schemaVersion":1,"restoreId":"' + 'ef' * 16 + '"}')
+            os.mkdir(os.path.join(idir, '.nexus-restore-staging'), 0o700)
+            result = instance.execute(request(
+                'adopt', revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            observed = instance.execute(observe())
+            self.assertTrue(observed['restorePending'])
+            result = instance.execute(request('start', op='bb' * 16,
+                                              revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'restore-incomplete')
+
+    def test_adopt_resume_after_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            # Journal says adopted but the dir is already root-owned —
+            # the crash landed between claim and the phase commit.
+            insert_instance(instance, digest, phase='preparing')
+            instance.db.execute(
+                'UPDATE instances SET adopted=1 WHERE instance_id=?',
+                ('0a' * 16,))
+            instance.db.commit()
+            idir = os.path.join(storage, '0a' * 16)
+            os.mkdir(idir, 0o700)
+            leaf = os.path.join(idir, 'data')
+            os.mkdir(leaf, 0o700)
+            fs.owners[leaf] = (65536, 65536)
+            result = instance.execute(request(
+                'adopt', revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(result['appliedPhase'], 'prepared')
+            self.assertNotIn((idir, 0, 0), fs.chowns)
+
+    def test_adopt_on_normal_instance_conflicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            instance.execute(request('prepare', op='aa' * 16,
+                                     revisionDigest=digest))
+            result = instance.execute(request(
+                'adopt', op='ab' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'instance-conflict')
+
+    def test_adopt_uses_bound_slot_uidbase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            # Slot 'first' is held by an unrelated workload, so adoption
+            # binds slot 'second' (uidBase 131072) — a replica carrying
+            # the first slot's ownership is asymmetric and must fail
+            # rather than be translated.
+            instance.db.execute(
+                "INSERT INTO instances(instance_id, workload_id,"
+                " revision_digest, generation, slot_id, machine_name,"
+                " phase, requirements) VALUES(?,?,?,?,?,?,?,?)",
+                ('7e' * 16, 'other', digest, 1, 'first',
+                 worker._machine_name('7e' * 16), 'prepared',
+                 artifacts.canonical_bytes(
+                     {'memoryMiB': 1, 'cpuMillis': 1,
+                      'stateBytes': 1}).decode()))
+            instance.db.commit()
+            idir = self._replica(storage, fs, uid_base=65536)
+            result = instance.execute(request(
+                'adopt', revisionDigest=digest))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'],
+                             'adopt-ownership-conflict')
+            fs.owners[idir] = (131072, 131072)
+            fs.owners[os.path.join(idir, 'data')] = (131072, 131072)
+            result = instance.execute(request(
+                'adopt', op='ab' * 16, revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(
+                instance._get_instance('0a' * 16)['slot_id'], 'second')
+
+    def test_adopt_populated_leaves_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, _ = make_worker(tmp)
+            digest = definition['revisionDigest']
+            storage = instance.config['storage']['root']
+            idir = self._replica(storage, fs)
+            # Replicated application payload survives adoption —
+            # unlike resume-prepare, leaf contents are the whole point.
+            Path(idir, 'data', 'payload.db').write_text('replicated')
+            result = instance.execute(request(
+                'adopt', revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed', result)
+            self.assertEqual(
+                Path(idir, 'data', 'payload.db').read_text(),
+                'replicated')
+            result = instance.execute(request('start', op='bb' * 16,
+                                              revisionDigest=digest))
+            self.assertEqual(result['appliedPhase'], 'running')
+
+
 if __name__ == '__main__':
     unittest.main()

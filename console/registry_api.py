@@ -36,6 +36,7 @@ _POST_ACTIONS = {
     '/v2/hosts/session': 'open_session',
     '/v2/observations': 'observe',
     '/v2/placements/assign': 'assign',
+    '/v2/placements/fence': 'fence',
     '/v2/placements/publish': 'publish',
     '/v2/placements/withdraw': 'withdraw',
 }

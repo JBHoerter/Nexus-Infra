@@ -84,6 +84,13 @@ def placement_request(action_gen=1, request_id='c1' * 16):
             'workloadId': 'canary', 'expectedGeneration': action_gen}
 
 
+def fence_request(generation=1, host='host-a', request_id='f1' * 16,
+                  evidence='quorum-attested', workload='canary'):
+    return {'schemaVersion': 2, 'requestId': request_id,
+            'workloadId': workload, 'generation': generation,
+            'hostId': host, 'evidence': evidence}
+
+
 def observation(instance=I1, host='host-a', session='s', sequence=1, at=None,
                 phase='running', unit='active', drained=False, retired=False,
                 endpoint='192.168.140.2', ready=(), digest=DIGEST,
@@ -961,3 +968,206 @@ class OperationQueueTests(unittest.TestCase):
                              registry._OPERATION_POLL_MAX)
             seqs = [op['seq'] for op in listed['operations']]
             self.assertEqual(seqs, sorted(seqs))
+
+
+class FenceTests(unittest.TestCase):
+    """M8 placement-fence records: controller-posted, durable, scoped to
+    (workloadId, generation) and bound to the incumbent host. A fence
+    only substitutes for retired+drained evidence at assign time; it
+    never affects routes or observed state of a live instance."""
+
+    def test_fence_post_and_state_projection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = make_registry(tmp)
+            reg.assign(CONTROLLER, assign_request())
+            self.assertEqual(reg.state(READER)['fences'], [])
+            result = reg.fence(CONTROLLER, fence_request())
+            self.assertEqual(result, {
+                'schemaVersion': 2, 'status': 'accepted',
+                'requestId': 'f1' * 16, 'workloadId': 'canary',
+                'generation': 1, 'hostId': 'host-a',
+                'evidence': 'quorum-attested'})
+            fences = reg.state(READER)['fences']
+            self.assertEqual(len(fences), 1)
+            fence = fences[0]
+            self.assertEqual(fence['workloadId'], 'canary')
+            self.assertEqual(fence['generation'], 1)
+            self.assertEqual(fence['hostId'], 'host-a')
+            self.assertEqual(fence['evidence'], 'quorum-attested')
+            self.assertEqual(fence['attestedBy'], 'urn:controller')
+            self.assertEqual(fence['requestId'], 'f1' * 16)
+            self.assertEqual(fence['recordedAt'], fake.now)
+
+    def test_assign_via_fence_without_retired_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = make_registry(tmp)
+            reg.assign(CONTROLLER, assign_request(I1, 'host-a', 0,
+                                                  'a1' * 16))
+            # The host is dead: it can never report retired+drained.
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.assign(CONTROLLER, assign_request(I2, 'host-b', 1,
+                                                      'a2' * 16))
+            self.assertEqual(ctx.exception.code, 'retirement-required')
+            reg.fence(CONTROLLER, fence_request())
+            result = reg.assign(CONTROLLER, assign_request(
+                I2, 'host-b', 1, 'a2' * 16))
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['generation'], 2)
+            entry = reg.state(READER)['workloads'][0]
+            self.assertEqual((entry['generation'], entry['hostId']),
+                             (2, 'host-b'))
+            # The consumed fence stays as a durable tombstone; it does
+            # not unblock a third generation.
+            self.assertEqual(len(reg.state(READER)['fences']), 1)
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.assign(CONTROLLER, assign_request(I3, 'host-a', 2,
+                                                      'a3' * 16))
+            self.assertEqual(ctx.exception.code, 'retirement-required')
+            reg.fence(CONTROLLER, fence_request(
+                generation=2, host='host-b', request_id='f2' * 16))
+            result = reg.assign(CONTROLLER, assign_request(
+                I3, 'host-a', 2, 'a3' * 16))
+            self.assertEqual(result['generation'], 3)
+
+    def test_fence_scoped_to_current_incumbent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = make_registry(tmp)
+            # No placement yet: nothing to fence.
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.fence(CONTROLLER, fence_request())
+            self.assertEqual(ctx.exception.code, 'generation-conflict')
+            reg.assign(CONTROLLER, assign_request())
+            for mutated, code in (
+                    (fence_request(generation=0), 'invalid-generation'),
+                    (fence_request(generation=2),
+                     'generation-conflict'),
+                    (fence_request(host='host-b'),
+                     'generation-conflict'),
+                    (fence_request(host='ghost'), 'unknown-host'),
+                    (fence_request(workload='ghost'),
+                     'unknown-workload')):
+                with self.assertRaises(registry.RegistryError,
+                                       msg=mutated) as ctx:
+                    reg.fence(CONTROLLER, mutated)
+                self.assertEqual(ctx.exception.code, code)
+            # A fence for another generation is never posted: fencing is
+            # always the CURRENT incumbent, so a stale scope 409s.
+            gen2(reg, fake)
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.fence(CONTROLLER, fence_request(
+                    generation=1, host='host-a', request_id='f2' * 16))
+            self.assertEqual(ctx.exception.code, 'generation-conflict')
+
+    def test_fence_replay_and_conflicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = make_registry(tmp)
+            reg.assign(CONTROLLER, assign_request())
+            first = reg.fence(CONTROLLER, fence_request())
+            # Identical replay returns the recorded receipt.
+            self.assertEqual(
+                reg.fence(CONTROLLER, fence_request()), first)
+            # Same requestId, different body or principal: conflict.
+            for mutated in (
+                    dict(fence_request(), evidence='operator'),
+                    dict(fence_request(), hostId='host-b')):
+                with self.assertRaises(registry.RegistryError,
+                                       msg=mutated) as ctx:
+                    reg.fence(CONTROLLER, mutated)
+                self.assertEqual(ctx.exception.code,
+                                 'request-conflict')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.fence(CONTROLLER_2, fence_request())
+            self.assertEqual(ctx.exception.code, 'request-conflict')
+            # A distinct requestId re-attesting the identical scope and
+            # evidence is a harmless duplicate — recorded and accepted.
+            again = reg.fence(CONTROLLER, fence_request(
+                request_id='f2' * 16))
+            self.assertEqual(again['status'], 'accepted')
+            self.assertEqual(len(reg.state(READER)['fences']), 1)
+            # A differing attestation for the same scope conflicts.
+            # (hostId is pinned to the incumbent, so only evidence can
+            # differ at this point — a foreign hostId 409s earlier as
+            # generation-conflict.)
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.fence(CONTROLLER, fence_request(
+                    request_id='f3' * 16, evidence='operator'))
+            self.assertEqual(ctx.exception.code, 'fence-conflict')
+            with self.assertRaises(registry.RegistryError) as ctx:
+                reg.fence(CONTROLLER, fence_request(
+                    request_id='f4' * 16, host='host-b'))
+            self.assertEqual(ctx.exception.code, 'generation-conflict')
+
+    def test_fence_does_not_affect_live_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = make_registry(tmp)
+            published(reg, fake)
+            backend = reg.routes(INGRESS, NONCE)['routes'][0]['backend']
+            self.assertEqual(backend['instanceId'], I2)
+            # Fencing the LIVE incumbent changes nothing observable.
+            reg.fence(CONTROLLER, fence_request(
+                generation=2, host='host-b', request_id='f1' * 16))
+            entry = reg.state(READER)['workloads'][0]
+            self.assertEqual(entry['observedState'], 'running')
+            self.assertEqual(
+                reg.routes(INGRESS, NONCE)['routes'][0]['backend'],
+                backend)
+            # It does, however, permit the successor assign even though
+            # host-b still reports running (the partitioned-survivor
+            # case).
+            result = reg.assign(CONTROLLER, assign_request(
+                I3, 'host-a', 2, 'a3' * 16))
+            self.assertEqual(result['generation'], 3)
+            # Placement moved: stale old-host reports no longer route.
+            self.assertIsNone(
+                reg.routes(INGRESS, NONCE)['routes'][0]['backend'])
+
+    def test_fence_survives_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = make_registry(tmp)
+            reg.assign(CONTROLLER, assign_request())
+            reg.fence(CONTROLLER, fence_request())
+            reg.close()
+            _LIVE.remove(reg)
+            reg2, fake2 = make_registry(tmp, epoch='epoch-2',
+                                        fake=FakeTime(1100.0, 900.0))
+            fences = reg2.state(READER)['fences']
+            self.assertEqual(len(fences), 1)
+            self.assertEqual(fences[0]['hostId'], 'host-a')
+            self.assertEqual(fences[0]['attestedBy'], 'urn:controller')
+            # Replay still returns the durable receipt post-restart.
+            replay = reg2.fence(CONTROLLER, fence_request())
+            self.assertEqual(replay['status'], 'accepted')
+            result = reg2.assign(CONTROLLER, assign_request(
+                I2, 'host-b', 1, 'a2' * 16))
+            self.assertEqual(result['generation'], 2)
+
+    def test_fence_validation_and_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, fake = make_registry(tmp)
+            reg.assign(CONTROLLER, assign_request())
+            for mutated, code in (
+                    (dict(fence_request(), schemaVersion=1),
+                     'invalid-schemaVersion'),
+                    (dict(fence_request(), requestId='zz' * 16),
+                     'invalid-requestId'),
+                    (dict(fence_request(), workloadId='CAN'),
+                     'invalid-workloadId'),
+                    (dict(fence_request(), generation=True),
+                     'invalid-generation'),
+                    (dict(fence_request(), hostId='BAD'),
+                     'invalid-hostId'),
+                    (dict(fence_request(), evidence='stonith'),
+                     'invalid-evidence'),
+                    (dict(fence_request(), evidence=None),
+                     'invalid-evidence'),
+                    (dict(fence_request(), extra=1),
+                     'invalid-request-fields')):
+                with self.assertRaises(registry.RegistryError,
+                                       msg=mutated) as ctx:
+                    reg.fence(CONTROLLER, mutated)
+                self.assertEqual(ctx.exception.code, code)
+            for bad in (READER, INGRESS, P_HOST_A):
+                with self.assertRaises(registry.RegistryError) as ctx:
+                    reg.fence(bad, fence_request())
+                self.assertEqual(ctx.exception.status, 403)
+            self.assertEqual(reg.state(READER)['fences'], [])

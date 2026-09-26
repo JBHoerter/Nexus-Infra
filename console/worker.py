@@ -1,3 +1,24 @@
+"""Local worker executor for Nexus workload instances.
+
+Durable, exactly-once operation journal in ``<stateDir>/worker.db``;
+every action validates, journals, applies and receipts under a single
+host flock so crashes replay rather than double-execute.
+
+``prepare`` refuses a pre-existing instance dir
+(``storage-state-conflict``) by deliberate invariant. ``adopt`` (M8) is
+the strictly validated exception for DRBD failover: the replicated
+instance dir may pre-exist only when its ownership is exactly the bound
+slot's ``uidBase`` (failover pairs keep ``uidBase`` symmetric so no idmap
+translation is needed — the separate restore path exists for cold
+restores), every declared ``stateMount`` id is present as a directory
+with slot-expected ownership, and nothing else sits at the top level
+besides the worker's own files. Valid adoptions are journaled with
+``adopted`` provenance so ``observe``/status can report it. Adoption is
+always explicit: no component performs it automatically, and there is
+no automatic failover trigger here — a future authorized failover
+controller (or operator) issues the request
+(docs/replication-failover-design.md).
+"""
 import argparse
 import base64
 import binascii
@@ -48,6 +69,11 @@ _VERIFY_BATCH = 128
 _SHOW_PROPERTIES = ('LoadState', 'ActiveState', 'SubState', 'MainPID',
                     'ControlGroup')
 _RESTORE_SENTINEL = '.nexus-restore-pending'
+# Top-level names the worker itself may place inside an instance dir:
+# the durable restore sentinel plus the restore staging area (the staging
+# name is shared with restore.py — keep them identical). Adoption of a
+# replicated dir tolerates exactly these extras; anything else conflicts.
+_ADOPT_OWN_FILES = frozenset({_RESTORE_SENTINEL, '.nexus-restore-staging'})
 
 
 def _fields(value, expected, context):
@@ -340,8 +366,8 @@ def validate_request(request):
         if request['action'] in ('freeze', 'thaw') else _REQUEST_FIELDS
     if set(request) != expected:
         raise WorkerError('invalid-request-fields')
-    if request['action'] not in ('prepare', 'start', 'stop', 'retire',
-                                 'freeze', 'thaw'):
+    if request['action'] not in ('prepare', 'adopt', 'start', 'stop',
+                                 'retire', 'freeze', 'thaw'):
         raise WorkerError('invalid-action')
     _hex32(request['operationId'], 'operationId')
     _identifier(request['workloadId'], 'workloadId')
@@ -369,7 +395,8 @@ CREATE TABLE IF NOT EXISTS instances(
     boot_id TEXT,
     permit_deadline REAL,
     permit INTEGER NOT NULL DEFAULT 0,
-    retired INTEGER NOT NULL DEFAULT 0);
+    retired INTEGER NOT NULL DEFAULT 0,
+    adopted INTEGER NOT NULL DEFAULT 0);
 CREATE UNIQUE INDEX IF NOT EXISTS current_workload
     ON instances(workload_id) WHERE phase IN
     ('preparing','prepared','starting','running','stopping','unknown');
@@ -548,6 +575,10 @@ class Worker(SecurePaths):
         if 'retired' not in columns:
             self.db.execute(
                 'ALTER TABLE instances ADD COLUMN retired'
+                ' INTEGER NOT NULL DEFAULT 0')
+        if 'adopted' not in columns:
+            self.db.execute(
+                'ALTER TABLE instances ADD COLUMN adopted'
                 ' INTEGER NOT NULL DEFAULT 0')
         self.db.commit()
         self._bundles = None
@@ -811,6 +842,78 @@ class Worker(SecurePaths):
                     or st.st_gid != slot['uidBase'] + mount['ownerGid']:
                 raise WorkerError('storage-state-conflict')
 
+    def _adopt_dirs(self, instance_dir, definition, slot, claimed):
+        """Strictly validate a pre-existing replicated instance dir for
+        adoption (M8). Returns True when the dir still carries the
+        replica's uidBase ownership and must be claimed (chown to root)
+        by the caller after the instance row is durably inserted.
+
+        Contract for the provisioning side of a failover pair (uidBase
+        is symmetric by design assumption — mismatched ownership means
+        the replica needs the idmap restore path, not adoption):
+
+        - the instance dir exists, is a real directory, mode 0700, and
+          is owned exactly ``uidBase:uidBase`` — the provenance marker a
+          peer never produces by local ``prepare`` (whose dirs are
+          root-owned). Once ``claimed`` (row journaled) a root-owned dir
+          is also accepted so a crash between claim and phase commit can
+          resume without wedging the slot;
+        - every declared ``stateMount`` id is present as a directory
+          owned exactly ``uidBase + ownerUid : uidBase + ownerGid`` — the
+          same ownership a peer worker set and ``_check_state_dirs``
+          requires later (``uidBase:uidBase`` for the common
+          zero-offset mounts);
+        - nothing else at the top level except the worker's own files
+          (restore sentinel, restore staging) which are re-validated and
+          left in place — a replicated sentinel correctly blocks
+          ``start`` with ``restore-incomplete``.
+
+        Rejections are typed and mutate nothing: ``adopt-state-absent``
+        (use normal ``prepare``), ``adopt-ownership-conflict`` and
+        ``adopt-state-conflict``.
+        """
+        self._check_ancestors(instance_dir)
+        st = self._lstat(instance_dir)
+        if st is None:
+            raise WorkerError('adopt-state-absent')
+        if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) \
+                or stat.S_IMODE(st.st_mode) != 0o700:
+            raise WorkerError('adopt-state-conflict')
+        owner = (st.st_uid, st.st_gid)
+        if owner == (slot['uidBase'], slot['uidBase']):
+            claim = True
+        elif claimed and owner == (0, 0):
+            claim = False
+        else:
+            raise WorkerError('adopt-ownership-conflict')
+        try:
+            names = set(self.fs.listdir(instance_dir))
+        except OSError:
+            raise WorkerError('path-unavailable') from None
+        leaf_ids = {mount['id'] for mount in definition['stateMounts']}
+        if not leaf_ids <= names \
+                or not names <= leaf_ids | _ADOPT_OWN_FILES:
+            raise WorkerError('adopt-state-conflict')
+        for name in names - leaf_ids:
+            own = self._lstat(os.path.join(instance_dir, name))
+            if name == _RESTORE_SENTINEL:
+                if own is None or not stat.S_ISREG(own.st_mode) \
+                        or own.st_uid != 0:
+                    raise WorkerError('adopt-state-conflict')
+            elif own is None or not stat.S_ISDIR(own.st_mode) \
+                    or stat.S_ISLNK(own.st_mode) or own.st_uid != 0:
+                raise WorkerError('adopt-state-conflict')
+        for mount in definition['stateMounts']:
+            leaf = os.path.join(instance_dir, mount['id'])
+            st = self._lstat(leaf)
+            if st is None or not stat.S_ISDIR(st.st_mode) \
+                    or stat.S_ISLNK(st.st_mode):
+                raise WorkerError('adopt-state-conflict')
+            if st.st_uid != slot['uidBase'] + mount['ownerUid'] \
+                    or st.st_gid != slot['uidBase'] + mount['ownerGid']:
+                raise WorkerError('adopt-ownership-conflict')
+        return claim
+
     def _render_env(self, rec, definition, manifest, slot):
         instance_dir = self._instance_dir(rec)
         binds = []
@@ -1030,6 +1133,8 @@ class Worker(SecurePaths):
         try:
             if request['action'] == 'prepare':
                 return self._prepare(request)
+            if request['action'] == 'adopt':
+                return self._prepare(request, adopt=True)
             if request['action'] == 'start':
                 return self._start(request)
             if request['action'] == 'retire':
@@ -1053,6 +1158,8 @@ class Worker(SecurePaths):
         try:
             if request['action'] == 'prepare':
                 return self._prepare(request)
+            if request['action'] == 'adopt':
+                return self._prepare(request, adopt=True)
             if request['action'] == 'start':
                 return self._resume_start(request)
             if request['action'] == 'retire':
@@ -1111,13 +1218,13 @@ class Worker(SecurePaths):
         row = self.db.execute(
             'SELECT instance_id, workload_id, revision_digest, generation, slot_id,'
             ' machine_name, phase, requirements, binding_json, boot_id,'
-            ' permit_deadline, permit, retired'
+            ' permit_deadline, permit, retired, adopted'
             ' FROM instances WHERE instance_id=?', (instance_id,)).fetchone()
         if row is None:
             return None
         keys = ('instance_id', 'workload_id', 'revision_digest', 'generation',
                 'slot_id', 'machine_name', 'phase', 'requirements', 'binding',
-                'boot_id', 'permit_deadline', 'permit', 'retired')
+                'boot_id', 'permit_deadline', 'permit', 'retired', 'adopted')
         rec = dict(zip(keys, row))
         rec['binding'] = json.loads(rec['binding']) if rec['binding'] else None
         return rec
@@ -1204,7 +1311,7 @@ class Worker(SecurePaths):
             ' generation=max(generation, excluded.generation)',
             (workload_id, generation))
 
-    def _prepare(self, request):
+    def _prepare(self, request, adopt=False):
         rec = self._get_instance(request['instanceId'])
         resume = rec is not None
         if resume:
@@ -1213,6 +1320,8 @@ class Worker(SecurePaths):
                 raise WorkerError('instance-retired')
             if rec['phase'] not in ('preparing', 'prepared'):
                 raise WorkerError('phase-conflict')
+            if bool(rec['adopted']) != adopt:
+                raise WorkerError('instance-conflict')
             self._require_binding_current(rec)
             bundle, manifest, definition = self._resolve(
                 rec['workload_id'], rec['revision_digest'])
@@ -1237,10 +1346,19 @@ class Worker(SecurePaths):
         self._orphan_check()
         if not resume:
             self._check_workload_drained(request['workloadId'])
-            if self._lstat(os.path.join(self.config['storage']['root'],
-                                        request['instanceId'])) is not None:
-                raise WorkerError('storage-state-conflict')
             slot = self._free_slot()
+            instance_dir = os.path.join(self.config['storage']['root'],
+                                        request['instanceId'])
+            if adopt:
+                # Fully validated BEFORE the instance row is journaled:
+                # a rejected replica leaves no record, so a corrected
+                # dir can be adopted under a fresh operationId and plain
+                # prepare still fails the pre-existing dir as
+                # storage-state-conflict.
+                self._adopt_dirs(instance_dir, definition, slot,
+                                 claimed=False)
+            elif self._lstat(instance_dir) is not None:
+                raise WorkerError('storage-state-conflict')
             machine = _machine_name(request['instanceId'])
             binding = {'hostId': self.config['hostId'],
                        'architecture': self.config['architecture'],
@@ -1250,14 +1368,15 @@ class Worker(SecurePaths):
                 self.db.execute(
                     'INSERT INTO instances(instance_id, workload_id,'
                     ' revision_digest, generation, slot_id, machine_name,'
-                    ' phase, requirements, binding_json)'
-                    ' VALUES(?,?,?,?,?,?,?,?,?)',
+                    ' phase, requirements, binding_json, adopted)'
+                    ' VALUES(?,?,?,?,?,?,?,?,?,?)',
                     (request['instanceId'], request['workloadId'],
                      request['revisionDigest'], request['generation'],
                      slot['id'], machine, 'preparing',
                      artifacts.canonical_bytes(
                          self._requirements_of(definition)).decode('utf-8'),
-                     artifacts.canonical_bytes(binding).decode('utf-8')))
+                     artifacts.canonical_bytes(binding).decode('utf-8'),
+                     1 if adopt else 0))
                 self._set_highest_generation(
                     request['workloadId'], request['generation'])
                 self.db.commit()
@@ -1271,7 +1390,20 @@ class Worker(SecurePaths):
             self._check_state_dirs(rec, definition, slot)
             self._render_runtime_files(rec, definition, manifest, slot)
             return self._finish(request, 'completed', 'prepared')
-        self._allocate_state_dirs(rec, definition, slot, resume)
+        if adopt:
+            # Re-validate, then claim: the uidBase-owned replica dir
+            # becomes a normal root-owned instance dir, so every later
+            # invariant (_check_state_dirs, restore leaf checks, guard)
+            # sees exactly the layout a local prepare would have made —
+            # except the leaves keep their replicated payload.
+            instance_dir = self._instance_dir(rec)
+            if self._adopt_dirs(instance_dir, definition, slot,
+                                claimed=True):
+                self.fs.chown(instance_dir, 0, 0)
+                self.fs.sync_dir(instance_dir)
+                self.fs.sync_dir(rec['binding']['storage']['root'])
+        else:
+            self._allocate_state_dirs(rec, definition, slot, resume)
         self._render_runtime_files(rec, definition, manifest, slot)
         self.db.execute('UPDATE instances SET phase=? WHERE instance_id=?',
                         ('prepared', rec['instance_id']))
@@ -1597,6 +1729,7 @@ class Worker(SecurePaths):
             'observedAt': self.clock.time(),
             'phase': rec['phase'],
             'retired': bool(rec['retired']),
+            'adopted': bool(rec['adopted']),
             'unitDrained': self._unit_drained(show),
             'captureId': self._capture_id_of(rec['instance_id']),
             'restorePending': self._restore_pending(rec),
