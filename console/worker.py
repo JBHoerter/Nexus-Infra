@@ -98,7 +98,15 @@ _OBSERVE_FIELDS = {'schemaVersion', 'action', 'instanceId'}
 # carries this field set to the exact JSON boolean true. Dep-less
 # workloads may omit it entirely; it never appears on observe, whose
 # strict field set is separate.
-_REQUEST_OPTIONAL = {'dependenciesResolved'}
+# ``slotId`` is the OPTIONAL slot pin on prepare/adopt: when set, the
+# fresh allocation binds that configured slot (``_free_slot``) instead
+# of the first free one — ``slot-unavailable`` if occupied,
+# ``unknown-slot`` if not configured. LAN-facing deployments use it to
+# keep a workload's point-to-point address stable so host-level
+# DNAT/DNS records can target it. It is honored only at allocation;
+# resumed prepare/adopt must retain the recorded pin. Other actions
+# and observe reject it so it cannot appear effective after allocation.
+_REQUEST_OPTIONAL = {'dependenciesResolved', 'slotId'}
 _RESERVE_PHASES = ('preparing', 'prepared', 'starting', 'running', 'stopping',
                    'unknown')
 _PERMIT_SECONDS = 60
@@ -561,7 +569,7 @@ def validate_request(request):
         raise WorkerError('invalid-request-fields')
     _integer(request['schemaVersion'], 1, 1, 'schemaVersion')
     if fields == _OBSERVE_FIELDS:
-        if 'dependenciesResolved' in request:
+        if 'dependenciesResolved' in request or 'slotId' in request:
             raise WorkerError('invalid-request-fields')
         if request['action'] != 'observe':
             raise WorkerError('invalid-action')
@@ -581,6 +589,10 @@ def validate_request(request):
     _integer(request['generation'], 1, _MAX_I64, 'generation')
     if 'captureId' in request:
         _hex32(request['captureId'], 'captureId')
+    if 'slotId' in request:
+        if request['action'] not in ('prepare', 'adopt'):
+            raise WorkerError('invalid-request-fields')
+        _identifier(request['slotId'], 'slotId')
     return request['action'], request
 
 
@@ -1865,6 +1877,8 @@ class Worker(SecurePaths):
             if bool(rec['adopted']) != adopt:
                 raise WorkerError('instance-conflict')
             self._require_binding_current(rec)
+            if 'slotId' in request and request['slotId'] != rec['slot_id']:
+                raise WorkerError('slot-conflict')
             bundle, manifest, definition = self._resolve(
                 rec['workload_id'], rec['revision_digest'])
         else:
@@ -1889,7 +1903,7 @@ class Worker(SecurePaths):
         self._orphan_check()
         if not resume:
             self._check_workload_drained(request['workloadId'])
-            slot = self._free_slot()
+            slot = self._free_slot(request.get('slotId'))
             instance_dir = os.path.join(self.config['storage']['root'],
                                         request['instanceId'])
             if adopt:
@@ -2292,8 +2306,15 @@ class Worker(SecurePaths):
                 return slot
         raise WorkerError('slot-conflict')
 
-    def _free_slot(self):
+    def _free_slot(self, requested=None):
         used = {row[0] for row in self.db.execute('SELECT slot_id FROM instances')}
+        if requested is not None:
+            for slot in self.config['slots']:
+                if slot['id'] == requested:
+                    if requested in used:
+                        raise WorkerError('slot-unavailable')
+                    return slot
+            raise WorkerError('unknown-slot')
         for slot in self.config['slots']:
             if slot['id'] not in used:
                 return slot

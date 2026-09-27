@@ -610,6 +610,79 @@ class PrepareTests(unittest.TestCase):
                                               revisionDigest=digest))
             self.assertEqual(result['appliedPhase'], 'stopped')
 
+    def test_pinned_slot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, manifest = make_worker(tmp)
+            digest = definition['revisionDigest']
+            result = instance.execute(request('prepare', revisionDigest=digest,
+                                              slotId='second'))
+            self.assertEqual(result['status'], 'completed')
+            machine = worker._machine_name('0a' * 16)
+            env = Path(tmp, 'worker-state', 'instances', machine,
+                       'nspawn.env').read_text()
+            self.assertIn('PRIVATE_USERS=131072', env)
+            self.assertIn('LOCAL_ADDRESS=192.168.131.2', env)
+            self.assertIn('HOST_ADDRESS=192.168.131.1', env)
+            result = instance.execute(observe())
+            self.assertEqual(result['slotId'], 'second')
+
+    def test_pinned_slot_conflict_and_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, manifest = make_worker(tmp)
+            digest = definition['revisionDigest']
+            result = instance.execute(request('prepare', revisionDigest=digest))
+            self.assertEqual(result['status'], 'completed')
+            result = instance.execute(request(
+                'prepare', instance='0b' * 16, op='bb' * 16, generation=2,
+                revisionDigest=digest, slotId='first'))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'slot-unavailable')
+            result = instance.execute(request(
+                'prepare', instance='0c' * 16, op='cc' * 16, generation=2,
+                revisionDigest=digest, slotId='missing'))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'unknown-slot')
+
+    def test_pinned_slot_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, runner, fs, clock, definition, manifest = make_worker(tmp)
+            digest = definition['revisionDigest']
+            result = instance.execute(request('prepare', revisionDigest=digest,
+                                              slotId='second'))
+            self.assertEqual(result['status'], 'completed')
+            # Resumed prepare with the same pin is idempotent.
+            result = instance.execute(request('prepare', op='bb' * 16,
+                                              revisionDigest=digest,
+                                              slotId='second'))
+            self.assertEqual(result['status'], 'completed')
+            # A resumed prepare pinned at a different slot must not
+            # silently accept the re-pin.
+            result = instance.execute(request('prepare', op='cc' * 16,
+                                              revisionDigest=digest,
+                                              slotId='first'))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error'], 'slot-conflict')
+            result = instance.execute(observe())
+            self.assertEqual(result['slotId'], 'second')
+
+    def test_slot_id_rejected_off_allocate(self):
+        digest = 'sha256:' + '0' * 64
+        for action in ('start', 'stop', 'retire', 'freeze', 'thaw'):
+            req = request(action, slotId='first')
+            req['revisionDigest'] = digest
+            if action in ('freeze', 'thaw'):
+                req['captureId'] = 'dd' * 16
+            with self.assertRaises(worker.WorkerError, msg=action):
+                worker.validate_request(req)
+        bad = observe()
+        bad['slotId'] = 'first'
+        with self.assertRaises(worker.WorkerError):
+            worker.validate_request(bad)
+        req = request('prepare', slotId=42)
+        req['revisionDigest'] = digest
+        with self.assertRaises(worker.WorkerError):
+            worker.validate_request(req)
+
     def test_no_shell_or_overlay_invocations(self):
         with tempfile.TemporaryDirectory() as tmp:
             instance, runner, fs, clock, definition, _ = make_worker(tmp)
