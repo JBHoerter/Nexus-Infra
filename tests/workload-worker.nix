@@ -6,7 +6,7 @@ in { pkgs, ... }: {
   name = "nexus-workload-worker";
   globalTimeout = 15 * 60;
   nodes = {
-    source = { pkgs, ... }: {
+    source = { pkgs, lib, ... }: {
       imports = [ (hostNode {
         hostId = "host-a";
         uuid = "11111111-2222-3333-4444-555555555555";
@@ -15,6 +15,11 @@ in { pkgs, ... }: {
           { id = "second"; uidBase = 131072; hostAddress = "192.168.131.1"; localAddress = "192.168.131.2"; }
         ];
       }) ];
+      # Alternate profile changing only the workload unit text
+      # (TimeoutStartSec 300 -> 299). With X-RestartIfChanged=false the
+      # switch must leave bound running instances untouched.
+      specialisation.unit-update.configuration.services.nexus-workload-worker.startTimeoutSeconds =
+        lib.mkForce 299;
       # Isolated resolver fixture: a host-local loopback alias that guests
       # reach through the ve- link, serving exactly one test name.
       # networking.interfaces cannot touch lo, so add the alias at boot.
@@ -143,6 +148,19 @@ in { pkgs, ... }: {
         assert "root=/var/lib/nexus-workload-runtime/" in env, env
         assert "/run/nexus-workloads" not in env, env
         assert_guest_dns(source, observed["machineName"])
+
+    with subtest("host profile switch does not restart bound workload units"):
+        source.succeed(
+            "/run/current-system/specialisation/unit-update/bin/switch-to-configuration test")
+        assert source.succeed(
+            "systemctl show " + unit + " --property=ActiveState --value").strip() == "active"
+        assert source.succeed(
+            "systemctl show " + unit + " --property=MainPID --value").strip() == pid
+        source.succeed(host_closure + "/bin/switch-to-configuration test")
+        assert source.succeed(
+            "systemctl show " + unit + " --property=ActiveState --value").strip() == "active"
+        assert source.succeed(
+            "systemctl show " + unit + " --property=MainPID --value").strip() == pid
 
     with subtest("operation replay returns receipt without restarting"):
         rc, replay = worker(source, request("ac" * 16, "start", INSTANCE_A, 1))

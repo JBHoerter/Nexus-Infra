@@ -158,6 +158,7 @@ in {
       RequiresMountsFor=${cfg.storage.mountPoint} /var/lib/nexus-workload-runtime
 
       [Service]
+      X-RestartIfChanged=false
       Type=${upstream.serviceConfig.Type}
       SyslogIdentifier=nexus-workload %i
       Environment=INSTANCE=%i
