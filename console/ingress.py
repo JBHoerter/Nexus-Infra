@@ -57,6 +57,10 @@ _MAX_SNAPSHOT = 1024 * 1024
 _FETCH_TIMEOUT = 3
 _POLL_INTERVAL = 2
 _MAX_VALIDITY = 10
+# Permit at most 1 s of registry-clock lead; the same budget is
+# subtracted from expiry so the allowance never extends the registry
+# lease.
+_MAX_CLOCK_SKEW = 1.0
 
 
 def _check(fn, *args):
@@ -190,12 +194,13 @@ def validate_snapshot(snapshot, config, nonce, *, now, highwater):
         raise IngressError('nonce-mismatch')
     generated = _time(snapshot['generatedAt'], 'invalid-generatedAt')
     valid_until = _time(snapshot['validUntil'], 'invalid-validUntil')
-    if generated > now:
+    if generated > now + _MAX_CLOCK_SKEW:
         raise IngressError('snapshot-future')
     if now - generated > _MAX_VALIDITY:
         raise IngressError('snapshot-stale')
-    if not 0 < valid_until - now <= _MAX_VALIDITY \
-            or valid_until > generated + _MAX_VALIDITY:
+    remaining = valid_until - now - _MAX_CLOCK_SKEW
+    if not 0 < valid_until - generated <= _MAX_VALIDITY \
+            or not 0 < remaining <= _MAX_VALIDITY:
         raise IngressError('invalid-validUntil')
     routes = snapshot['routes']
     configured = config['registry']['routes']
@@ -352,10 +357,11 @@ class Ingress:
             return None
         if not 0 <= now - self._received_wall:
             return None
-        if now >= snapshot['validUntil']:
+        expiry = snapshot['validUntil'] - _MAX_CLOCK_SKEW
+        if now >= expiry:
             return None
         if not 0 <= mono - self._received_mono \
-                < snapshot['validUntil'] - self._received_wall:
+                < expiry - self._received_wall:
             return None
         return snapshot
 
@@ -473,7 +479,10 @@ def _run(ingress, server):
                 ingress.poll()
             except Exception as error:
                 print(json.dumps({'event': 'poll-error',
-                                  'type': type(error).__name__}),
+                                  'type': type(error).__name__,
+                                  'error': error.code
+                                  if isinstance(error, IngressError)
+                                  else 'unexpected-error'}),
                       flush=True)
             stop.wait(_POLL_INTERVAL)
 

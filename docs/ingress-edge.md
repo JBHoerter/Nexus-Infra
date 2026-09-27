@@ -19,7 +19,13 @@ entire security contract — it is not a reimplementation:
   echo it;
 - snapshots are strictly validated (fields, bounded timestamps, ≤10 s
   validity window, every route/backend re-derived against the
-  administrator-pinned `registry` config embedded in `config.json`);
+  administrator-pinned `registry` config embedded in `config.json`). A
+  bounded 1 s clock-skew allowance tolerates the registry clock leading
+  the consumer's by at most one second; the same budget is subtracted
+  from `validUntil` on the consumer side, so inter-host skew can never
+  extend a snapshot's authorization lifetime — worst case the lease ends
+  at the registry's own deadline, earlier whenever the skew is smaller
+  or in the other direction;
 - a version high-water mark persists in `stateDir/version.json` so a
   replayed older snapshot can never restore a route;
 - `stateDir/ingress.lock` refuses a second consumer on the same state;

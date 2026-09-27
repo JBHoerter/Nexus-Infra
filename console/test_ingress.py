@@ -119,10 +119,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 'version-stale')
         cases = []
         cases.append((dict(good, nonce='cd' * 16), 'nonce-mismatch'))
-        cases.append((dict(good, generatedAt=1001.0), 'snapshot-future'))
+        cases.append((dict(good, generatedAt=1001.001), 'snapshot-future'))
         cases.append((dict(good, generatedAt=989.0), 'snapshot-stale'))
         cases.append((dict(good, validUntil=1000.0), 'invalid-validUntil'))
         cases.append((dict(good, validUntil=1011.0), 'invalid-validUntil'))
+        # validUntil must leave positive remaining life after the clock
+        # skew budget is subtracted.
+        cases.append((dict(good, validUntil=1000.5), 'invalid-validUntil'))
         cases.append((dict(good, validUntil=1005.0,
                            generatedAt=994.0), 'invalid-validUntil'))
         cases.append((dict(good, generatedAt=10**400),
@@ -216,6 +219,54 @@ class ConfigTests(unittest.TestCase):
 
 
 class IngressTests(unittest.TestCase):
+    def test_clock_skew_allowance_and_conservative_expiry(self):
+        for offset in (-1.0, 0.0, 0.03, 1.0):
+            with self.subTest(offset=offset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    fake = test_registry.FakeTime(now=1000.0)
+                    holder = {}
+
+                    def fetcher(nonce, holder=holder, offset=offset):
+                        holder['snap'] = snapshot(
+                            nonce, now=1000.0 + offset,
+                            validUntil=1010.0 + offset)
+                        return holder['snap']
+
+                    ing, _ = make_ingress(tmp, fake=fake,
+                                          fetcher=fetcher)
+                    ing.poll()
+                    snap = holder['snap']
+                    self.assertEqual(snap['generatedAt'], 1000.0 + offset)
+                    self.assertEqual(snap['validUntil'], 1010.0 + offset)
+                    token = route_token()
+                    self.assertTrue(ing.authorize('route-web', token))
+                    expiry = snap['validUntil'] - ingress._MAX_CLOCK_SKEW
+                    fake.now = expiry - 0.001
+                    fake.mono = 500.0 + (expiry - 1000.0) - 0.001
+                    self.assertTrue(ing.authorize('route-web', token))
+                    fake.now = expiry
+                    fake.mono = 500.0 + (expiry - 1000.0)
+                    self.assertFalse(ing.authorize('route-web', token))
+                    ing.close()
+
+    def test_monotonic_caps_expiry_when_wall_frozen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = test_registry.FakeTime(now=1000.0)
+            ing, _ = make_ingress(
+                tmp, fake=fake,
+                fetcher=lambda nonce: snapshot(nonce, now=1000.0))
+            ing.poll()
+            token = route_token()
+            expiry = 1008.0 - ingress._MAX_CLOCK_SKEW
+            # Wall clock frozen at receipt time: the monotonic clock
+            # alone must still cut the lease at the skew-adjusted
+            # expiry.
+            fake.mono = 500.0 + (expiry - 1000.0) - 0.001
+            self.assertTrue(ing.authorize('route-web', token))
+            fake.mono = 500.0 + (expiry - 1000.0)
+            self.assertFalse(ing.authorize('route-web', token))
+            ing.close()
+
     def test_poll_install_authorize_expire(self):
         with tempfile.TemporaryDirectory() as tmp:
             ing, fake = make_ingress(tmp)
