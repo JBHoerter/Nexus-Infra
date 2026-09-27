@@ -3862,5 +3862,26 @@ class SecretsProvisionTests(unittest.TestCase):
             self.assertNotIn('bind-ro', env)
 
 
+class RunnerTimeoutTests(unittest.TestCase):
+
+    def test_systemctl_start_gets_extended_timeout(self):
+        with mock.patch.object(worker.subprocess, 'run') as run:
+            worker.Runner().run(
+                ['systemctl', '--no-ask-password', 'start',
+                 'nexus-workload@x.service'])
+        self.assertEqual(run.call_args.kwargs['timeout'], 360)
+        self.assertTrue(run.call_args.kwargs['capture_output'])
+        self.assertTrue(run.call_args.kwargs['text'])
+
+    def test_systemctl_stop_keeps_default_timeout(self):
+        with mock.patch.object(worker.subprocess, 'run') as run:
+            worker.Runner().run(
+                ['systemctl', '--no-ask-password', 'stop',
+                 'nexus-workload@x.service'])
+        self.assertEqual(run.call_args.kwargs['timeout'], 300)
+        self.assertTrue(run.call_args.kwargs['capture_output'])
+        self.assertTrue(run.call_args.kwargs['text'])
+
+
 if __name__ == '__main__':
     unittest.main()

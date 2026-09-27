@@ -34,7 +34,12 @@ let
     (upstream.path ++ [ pkgs.systemd pkgs.coreutils pkgs.findutils pkgs.util-linux ]);
   startScript = pkgs.writeShellScript "nexus-workload-start" upstream.script;
   preStartScript = pkgs.writeShellScript "nexus-workload-prestart" upstream.preStart;
-  postStartScript = pkgs.writeShellScript "nexus-workload-poststart" upstream.postStart;
+  postStartScript = pkgs.writeShellScript "nexus-workload-poststart" (upstream.postStart + lib.optionalString (cfg.resolvConfFile != null) ''
+    ${pkgs.systemd}/bin/systemd-run --quiet --wait --pipe --collect \
+      --machine="$INSTANCE" --service-type=exec \
+      ${pkgs.openresolv}/bin/resolvconf -a nexus \
+      < ${lib.escapeShellArg cfg.resolvConfFile}
+  '');
 in {
   options.services.nexus-workload-worker = {
     enable = lib.mkEnableOption "the root-only local nexus workload worker";
@@ -90,6 +95,25 @@ in {
       default = null;
       description = "Root-owned 0700 host escrow directory holding <secretSetRef>.json envelope records and <secretSetRef>.blob sealed blobs; required when secretsProgram is set.";
     };
+    startTimeoutSeconds = lib.mkOption {
+      type = lib.types.ints.between 1 300;
+      default = 300;
+      description = "Maximum nspawn startup time; bounded below the worker's systemctl timeout.";
+    };
+    resolvConfFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Optional host resolver file whose nameservers are supplied to the
+        guest through openresolv (`resolvconf -a nexus`) after guest
+        activation — guest boot regenerates /etc/resolv.conf, so copying
+        or bind-mounting a file before activation does not survive. The
+        listed nameservers must be reachable from the guest's private
+        network; a loopback-only host resolver is not. Defaults to null
+        (opt out); guests then use only whatever their own image
+        configures.
+      '';
+    };
     configFile = lib.mkOption {
       type = lib.types.path;
       internal = true;
@@ -115,6 +139,10 @@ in {
               && lib.hasPrefix "/" cfg.secretsBundleDir);
         message = "services.nexus-workload-worker.secretsConfigFile and secretsBundleDir must be absolute paths";
       }
+      {
+        assertion = cfg.resolvConfFile == null || lib.hasPrefix "/" cfg.resolvConfFile;
+        message = "services.nexus-workload-worker.resolvConfFile must be an absolute path when set";
+      }
     ];
     boot.enableContainers = true;
     boot.kernelModules = [ "overlay" "tun" ];
@@ -127,21 +155,22 @@ in {
     systemd.units."nexus-workload@.service".text = ''
       [Unit]
       Description=Nexus workload instance '%i'
-      RequiresMountsFor=${cfg.storage.mountPoint}
+      RequiresMountsFor=${cfg.storage.mountPoint} /var/lib/nexus-workload-runtime
 
       [Service]
       Type=${upstream.serviceConfig.Type}
       SyslogIdentifier=nexus-workload %i
       Environment=INSTANCE=%i
-      Environment=root=/run/nexus-workloads/%i
+      Environment=root=/var/lib/nexus-workload-runtime/%i
       Environment=PATH=${pathEnv}
       EnvironmentFile=${cfg.stateDir}/instances/%i/nspawn.env
       ExecCondition=${workerCli}/bin/nexus-worker guard --machine %i
       ExecStartPre=${preStartScript}
       ExecStart=${startScript}
       ExecStartPost=${postStartScript}
-      RuntimeDirectory=nexus-workloads/%i
-      TimeoutStartSec=${upstream.serviceConfig.TimeoutStartSec}
+      StateDirectory=nexus-workload-runtime/%i
+      StateDirectoryMode=0700
+      TimeoutStartSec=${toString cfg.startTimeoutSeconds}
       Restart=no
       SuccessExitStatus=${toString upstream.serviceConfig.SuccessExitStatus}
       Slice=${upstream.serviceConfig.Slice}

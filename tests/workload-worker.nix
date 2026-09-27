@@ -6,13 +6,35 @@ in { pkgs, ... }: {
   name = "nexus-workload-worker";
   globalTimeout = 15 * 60;
   nodes = {
-    source = hostNode {
-      hostId = "host-a";
-      uuid = "11111111-2222-3333-4444-555555555555";
-      slots = [
-        { id = "first"; uidBase = 65536; hostAddress = "192.168.130.1"; localAddress = "192.168.130.2"; }
-        { id = "second"; uidBase = 131072; hostAddress = "192.168.131.1"; localAddress = "192.168.131.2"; }
-      ];
+    source = { pkgs, ... }: {
+      imports = [ (hostNode {
+        hostId = "host-a";
+        uuid = "11111111-2222-3333-4444-555555555555";
+        slots = [
+          { id = "first"; uidBase = 65536; hostAddress = "192.168.130.1"; localAddress = "192.168.130.2"; }
+          { id = "second"; uidBase = 131072; hostAddress = "192.168.131.1"; localAddress = "192.168.131.2"; }
+        ];
+      }) ];
+      # Isolated resolver fixture: a host-local loopback alias that guests
+      # reach through the ve- link, serving exactly one test name.
+      # networking.interfaces cannot touch lo, so add the alias at boot.
+      boot.postBootCommands = ''
+        ${pkgs.iproute2}/bin/ip addr add 192.0.2.53/32 dev lo
+      '';
+      services.dnsmasq = {
+        enable = true;
+        resolveLocalQueries = false;
+        settings = {
+          "bind-dynamic" = true;
+          "no-resolv" = true;
+          "listen-address" = [ "192.0.2.53" ];
+          "address" = [ "/dependency.test/192.0.2.42" ];
+        };
+      };
+      networking.firewall.allowedTCPPorts = [ 53 ];
+      networking.firewall.allowedUDPPorts = [ 53 ];
+      services.nexus-workload-worker.resolvConfFile =
+        "${pkgs.writeText "fixture-resolv.conf" "nameserver 192.0.2.53\n"}";
     };
     target = hostNode {
       hostId = "host-b";
@@ -62,6 +84,15 @@ in { pkgs, ... }: {
             "generation": generation,
         }
 
+    def assert_guest_dns(node, machine):
+        out = node.succeed(
+            "systemd-run --quiet --wait --pipe --collect"
+            " --machine=" + machine + " --service-type=exec"
+            " ${canary.system.pkgs.python3}/bin/python3 -c "
+            + shlex.quote(
+                "import socket; print(socket.gethostbyname('dependency.test'))"))
+        assert "192.0.2.42" in out, out
+
     start_all()
     revision = json.loads(Path("${canary.bundle}/definition.json").read_text())["revisionDigest"]
     assert "${canary.system.pkgs.stdenv.hostPlatform.system}" == "x86_64-linux"
@@ -105,6 +136,13 @@ in { pkgs, ... }: {
         leader = source.succeed("machinectl show " + observed["machineName"] + " --property=Leader --value").strip()
         assert source.succeed("readlink /proc/" + leader + "/root/run/current-system").strip() \
             == "${canary.system.config.system.build.toplevel}"
+        source.succeed(
+            "test -d /var/lib/nexus-workload-runtime/" + observed["machineName"])
+        env = source.succeed(
+            "systemctl show " + unit + " --property=Environment --value")
+        assert "root=/var/lib/nexus-workload-runtime/" in env, env
+        assert "/run/nexus-workloads" not in env, env
+        assert_guest_dns(source, observed["machineName"])
 
     with subtest("operation replay returns receipt without restarting"):
         rc, replay = worker(source, request("ac" * 16, "start", INSTANCE_A, 1))
@@ -167,6 +205,7 @@ in { pkgs, ... }: {
         source.wait_until_succeeds("curl --fail --silent http://192.168.130.2:8080/", timeout=120)
         guest = json.loads(source.succeed("curl --fail --silent http://192.168.130.2:8080/"))
         assert guest["value"] == "nexus-worker-canary", guest
+        assert_guest_dns(source, worker_module._machine_name(INSTANCE_A))
 
     with subtest("stale generation cannot start after newer prepare"):
         rc, result = worker(source, request("bd" * 16, "stop", INSTANCE_A, 1))
@@ -198,7 +237,8 @@ in { pkgs, ... }: {
         source.wait_until_succeeds("curl --fail --silent http://192.168.131.2:8080/", timeout=120)
         guest = json.loads(source.succeed("curl --fail --silent http://192.168.131.2:8080/"))
         assert guest["hostname"] == "canary", guest
-        assert guest["uid_map"] == ["0", "131072", "65536"], guest["uid_map"]
+        assert guest["uid_map"] == ["0", "131072", "65536"], guest
+        assert_guest_dns(source, machine_c)
         rc, result = worker(source, request("c1" * 16, "stop", INSTANCE_C, 2))
         assert result["status"] == "completed" and result["appliedPhase"] == "stopped", result
 

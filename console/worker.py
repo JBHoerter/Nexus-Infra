@@ -285,7 +285,8 @@ def validate_config(config):
 
 class Runner:
     def run(self, argv):
-        return subprocess.run(argv, capture_output=True, text=True, timeout=300)
+        timeout = 360 if argv[:3] == ['systemctl', '--no-ask-password', 'start'] else 300
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
 
 class SecretsCliRunner:
