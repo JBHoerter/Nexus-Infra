@@ -1191,7 +1191,10 @@ class Reporter:
         """Run the operation's step. ``_Refused`` becomes a permanent
         'failed' receipt; ReporterError propagates as transient and the
         claim survives for the next cycle."""
-        held = self._held(entry, assignments)
+        # An assignment can change after this cycle began, before an
+        # operation was queued. Authorize against a fresh snapshot at
+        # dispatch time.
+        held = self._held(entry, self._fetch_assignments())
         if held is None:
             raise _Refused('operation-not-held')
         step = entry['step']

@@ -541,6 +541,32 @@ class DispatchTests(ReporterFixture):
         self.assertEqual(receipts[1]['errorCode'],
                          'operation-not-held')
 
+    def test_dispatch_refreshes_assignment_added_during_cycle(self):
+        self.transport.assignments_responses = [
+            (200, {'schemaVersion': 2, 'hostId': 'host-a',
+                   'instances': []}),
+            (200, {'schemaVersion': 2, 'hostId': 'host-a',
+                   'instances': [assignment(I1)]})]
+        self.transport.operations = [self.worker_op('prepare')]
+        self.make_reporter().run_once()
+        self.assertEqual(len(self.executed), 1)
+        self.assertEqual(self.receipts()[-1]['status'], 'completed')
+        self.assertEqual(self.receipts()[-1]['result'],
+                         {'appliedPhase': 'prepared'})
+
+    def test_dispatch_refresh_rejects_assignment_removed_during_cycle(
+            self):
+        self.transport.assignments_responses = [
+            (200, {'schemaVersion': 2, 'hostId': 'host-a',
+                   'instances': [assignment(I1)]}),
+            (200, {'schemaVersion': 2, 'hostId': 'host-a',
+                   'instances': []})]
+        self.transport.operations = [self.worker_op('prepare')]
+        self.make_reporter().run_once()
+        self.assertEqual(self.executed, [])
+        self.assertEqual(self.receipts()[-1]['errorCode'],
+                         'operation-not-held')
+
     def test_dispatch_refuses_invalid_payload(self):
         bad = pending_operation(step='prepare',
                                 payload={'schemaVersion': 1})
